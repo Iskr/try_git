@@ -269,6 +269,14 @@ h1 {
     color: white;
 }
 
+.status-bar {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
 .connection-status {
     text-align: center;
     font-size: 14px;
@@ -277,6 +285,29 @@ h1 {
 
 .connection-status.connected {
     color: var(--success-color);
+}
+
+.encryption-indicator {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: linear-gradient(135deg, var(--success-color), #38a169);
+    color: white;
+    padding: 4px 12px;
+    border-radius: var(--radius-full);
+    font-size: 12px;
+    font-weight: 600;
+    box-shadow: var(--shadow-sm);
+    animation: fadeIn 0.3s ease;
+}
+
+.encryption-indicator.hidden {
+    display: none;
+}
+
+.encryption-indicator svg {
+    width: 14px;
+    height: 14px;
 }
 
 /* Layout Selector */
