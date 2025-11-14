@@ -262,6 +262,11 @@ h1 {
     color: var(--text-color);
 }
 
+.icon-btn.active {
+    background-color: var(--primary-color);
+    color: white;
+}
+
 .connection-status {
     text-align: center;
     font-size: 14px;
@@ -270,6 +275,54 @@ h1 {
 
 .connection-status.connected {
     color: var(--success-color);
+}
+
+/* Layout Selector */
+.layout-selector {
+    position: absolute;
+    top: 60px;
+    right: 20px;
+    background: var(--surface-color);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-xl);
+    padding: 8px;
+    z-index: 100;
+    min-width: 180px;
+    animation: slideDown 0.2s ease;
+    border: 1px solid var(--border-color);
+}
+
+.layout-selector.hidden {
+    display: none;
+}
+
+.layout-option {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    transition: all 0.2s ease;
+    color: var(--text-color);
+}
+
+.layout-option:hover {
+    background-color: var(--bg-color);
+}
+
+.layout-option.selected {
+    background: var(--primary-gradient);
+    color: white;
+}
+
+.layout-option svg {
+    flex-shrink: 0;
+}
+
+.layout-option span {
+    font-size: 15px;
+    font-weight: 500;
 }
 
 .videos-container {
@@ -283,23 +336,57 @@ h1 {
 }
 
 /* Dynamic grid layouts for different participant counts */
-.videos-container[data-participants="1"] {
+/* GRID MODE - all participants equal size */
+.videos-container[data-layout="grid"][data-participants="1"] {
     grid-template-columns: 1fr;
 }
 
-.videos-container[data-participants="2"] {
+.videos-container[data-layout="grid"][data-participants="2"] {
     grid-template-columns: 1fr 1fr;
 }
 
-.videos-container[data-participants="3"],
-.videos-container[data-participants="4"] {
+.videos-container[data-layout="grid"][data-participants="3"],
+.videos-container[data-layout="grid"][data-participants="4"] {
     grid-template-columns: 1fr 1fr;
     grid-template-rows: 1fr 1fr;
 }
 
-.videos-container[data-participants="5"] {
+.videos-container[data-layout="grid"][data-participants="5"] {
     grid-template-columns: 1fr 1fr;
     grid-template-rows: 1fr 1fr 1fr;
+}
+
+/* SPOTLIGHT MODE - one large, others small at bottom */
+.videos-container[data-layout="spotlight"] {
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    grid-template-rows: 1fr auto;
+    gap: 12px;
+}
+
+.videos-container[data-layout="spotlight"] .video-wrapper:first-child {
+    grid-column: 1 / -1;
+    grid-row: 1;
+}
+
+.videos-container[data-layout="spotlight"] .video-wrapper:not(:first-child) {
+    grid-row: 2;
+    max-height: 140px;
+}
+
+/* SIDEBAR MODE - main video on left, others on right sidebar */
+.videos-container[data-layout="sidebar"] {
+    grid-template-columns: 1fr 180px;
+    grid-template-rows: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 12px;
+}
+
+.videos-container[data-layout="sidebar"] .video-wrapper:first-child {
+    grid-column: 1;
+    grid-row: 1 / -1;
+}
+
+.videos-container[data-layout="sidebar"] .video-wrapper:not(:first-child) {
+    grid-column: 2;
 }
 
 .video-wrapper {
