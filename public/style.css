@@ -628,3 +628,126 @@ h1 {
         padding: 12px;
     }
 }
+
+/* Reactions System */
+.reactions-dropdown {
+    position: absolute;
+    bottom: 90px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface-color);
+    border-radius: var(--radius-md);
+    padding: 12px;
+    box-shadow: var(--shadow-xl);
+    border: 1px solid var(--border-color);
+    z-index: 1000;
+    min-width: 280px;
+    transition: all 0.2s ease;
+}
+
+.reactions-dropdown.hidden {
+    display: none;
+}
+
+.reactions-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+}
+
+.reaction-item {
+    width: 48px;
+    height: 48px;
+    border-radius: var(--radius-sm);
+    border: 2px solid var(--border-color);
+    background: var(--surface-color);
+    cursor: pointer;
+    font-size: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+    user-select: none;
+    position: relative;
+}
+
+.reaction-item:hover {
+    transform: scale(1.15);
+    border-color: var(--primary-color);
+    box-shadow: var(--shadow-md);
+    background: var(--bg-color);
+}
+
+.reaction-item:active {
+    transform: scale(1.0);
+}
+
+.reaction-count {
+    position: absolute;
+    bottom: -4px;
+    right: -4px;
+    background: var(--primary-color);
+    color: white;
+    font-size: 9px;
+    font-weight: bold;
+    padding: 2px 4px;
+    border-radius: 8px;
+    min-width: 16px;
+    text-align: center;
+    line-height: 1;
+}
+
+/* Reactions overlay for flying emojis */
+.reactions-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 90px;
+    pointer-events: none;
+    z-index: 999;
+    overflow: hidden;
+}
+
+.flying-reaction {
+    position: absolute;
+    font-size: 40px;
+    animation: flyUp 3s ease-out forwards;
+    pointer-events: none;
+    user-select: none;
+}
+
+@keyframes flyUp {
+    0% {
+        bottom: 0;
+        opacity: 1;
+        transform: translateX(0) scale(0.5) rotate(0deg);
+    }
+    10% {
+        opacity: 1;
+        transform: translateX(0) scale(1) rotate(5deg);
+    }
+    50% {
+        opacity: 1;
+        transform: translateX(var(--drift-x, 20px)) scale(1) rotate(var(--rotate, 10deg));
+    }
+    100% {
+        bottom: 100%;
+        opacity: 0;
+        transform: translateX(var(--drift-x, 40px)) scale(0.8) rotate(var(--rotate, 20deg));
+    }
+}
+
+/* Mobile adjustments for reactions */
+@media (max-width: 600px) {
+    .reactions-dropdown {
+        min-width: calc(100vw - 40px);
+        max-width: calc(100vw - 40px);
+    }
+
+    .reaction-item {
+        width: 44px;
+        height: 44px;
+        font-size: 24px;
+    }
+}
