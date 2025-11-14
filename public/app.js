@@ -1052,7 +1052,6 @@ class CallingApp {
             item.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.sendReaction(emoji);
-                this.toggleReactionsDropdown();
             });
 
             grid.appendChild(item);
