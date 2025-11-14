@@ -43,6 +43,7 @@ wss.on('connection', (ws) => {
         case 'offer':
         case 'answer':
         case 'ice-candidate':
+        case 'encryption-key':
           handleSignaling(data, currentRoom, clientId);
           break;
 
