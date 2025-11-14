@@ -328,7 +328,6 @@ class CallingApp {
         volumeSlider.addEventListener('input', (e) => {
             const value = e.target.value;
             volumeValue.textContent = value + '%';
-            this.updateVolumeSliderGradient(value);
 
             if (this.currentVolumeTarget) {
                 this.setParticipantVolume(this.currentVolumeTarget, value / 100);
@@ -1297,12 +1296,38 @@ class CallingApp {
         // Update slider
         volumeSlider.value = volumePercent;
         volumeValue.textContent = volumePercent + '%';
-        this.updateVolumeSliderGradient(volumePercent);
 
-        // Position popup near the button
+        // Position popup near the button, ensuring it stays within screen bounds
         const rect = buttonElement.getBoundingClientRect();
-        volumeControl.style.left = (rect.left - 30) + 'px';
-        volumeControl.style.top = (rect.bottom + 10) + 'px';
+        const popupWidth = 92; // approximate width of popup (60px min-width + padding)
+        const popupHeight = 230; // approximate height of popup
+
+        let left = rect.left - 30;
+        let top = rect.bottom + 10;
+
+        // Check if popup goes off the right edge
+        if (left + popupWidth > window.innerWidth) {
+            left = window.innerWidth - popupWidth - 10;
+        }
+
+        // Check if popup goes off the left edge
+        if (left < 10) {
+            left = 10;
+        }
+
+        // Check if popup goes off the bottom edge
+        if (top + popupHeight > window.innerHeight) {
+            // Position above the button instead
+            top = rect.top - popupHeight - 10;
+        }
+
+        // Check if popup goes off the top edge
+        if (top < 10) {
+            top = 10;
+        }
+
+        volumeControl.style.left = left + 'px';
+        volumeControl.style.top = top + 'px';
 
         // Show popup
         volumeControl.classList.remove('hidden');
@@ -1335,12 +1360,6 @@ class CallingApp {
         }
 
         console.log(`Set volume for ${clientId}: ${Math.round(volume * 100)}%`);
-    }
-
-    updateVolumeSliderGradient(value) {
-        const slider = document.getElementById('volume-slider');
-        const percentage = value / 2; // Since max is 200
-        slider.style.background = `linear-gradient(to bottom, var(--primary-color) 0%, var(--primary-color) ${percentage}%, var(--border-color) ${percentage}%, var(--border-color) 100%)`;
     }
 
     endCall() {
