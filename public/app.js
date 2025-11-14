@@ -16,6 +16,7 @@ class CallingApp {
         this.remoteClientId = null;
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
+        this.pendingIceCandidates = []; // Buffer for ICE candidates
 
         this.initUI();
         this.connectWebSocket();
@@ -236,10 +237,37 @@ class CallingApp {
     }
 
     async handleOffer(message) {
+        // Ensure we have local stream before creating peer connection
+        if (!this.localStream) {
+            try {
+                this.localStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        facingMode: 'user'
+                    },
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+                this.localVideo.srcObject = this.localStream;
+            } catch (error) {
+                console.error('Error accessing media devices:', error);
+                this.showToast('Не удалось получить доступ к камере/микрофону');
+                return;
+            }
+        }
+
         const pc = this.createPeerConnection(message.senderId);
 
         try {
             await pc.setRemoteDescription(new RTCSessionDescription(message.offer));
+
+            // Process any pending ICE candidates
+            await this.processPendingIceCandidates();
+
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
 
@@ -256,6 +284,9 @@ class CallingApp {
     async handleAnswer(message) {
         try {
             await this.peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+
+            // Process any pending ICE candidates
+            await this.processPendingIceCandidates();
         } catch (error) {
             console.error('Error handling answer:', error);
         }
@@ -264,10 +295,35 @@ class CallingApp {
     async handleIceCandidate(message) {
         try {
             if (this.peerConnection) {
-                await this.peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                const candidate = new RTCIceCandidate(message.candidate);
+
+                // Check if remote description is set
+                if (this.peerConnection.remoteDescription) {
+                    await this.peerConnection.addIceCandidate(candidate);
+                } else {
+                    // Buffer the candidate until remote description is set
+                    this.pendingIceCandidates.push(candidate);
+                    console.log('Buffered ICE candidate, total pending:', this.pendingIceCandidates.length);
+                }
             }
         } catch (error) {
             console.error('Error adding ICE candidate:', error);
+        }
+    }
+
+    async processPendingIceCandidates() {
+        if (this.pendingIceCandidates.length > 0 && this.peerConnection) {
+            console.log('Processing', this.pendingIceCandidates.length, 'pending ICE candidates');
+
+            for (const candidate of this.pendingIceCandidates) {
+                try {
+                    await this.peerConnection.addIceCandidate(candidate);
+                } catch (error) {
+                    console.error('Error adding pending ICE candidate:', error);
+                }
+            }
+
+            this.pendingIceCandidates = [];
         }
     }
 
@@ -282,6 +338,7 @@ class CallingApp {
 
         this.remoteVideo.srcObject = null;
         this.remoteClientId = null;
+        this.pendingIceCandidates = [];
     }
 
     toggleAudio() {
@@ -345,6 +402,7 @@ class CallingApp {
         this.remoteClientId = null;
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
+        this.pendingIceCandidates = [];
 
         // Update UI
         this.localVideo.srcObject = null;
