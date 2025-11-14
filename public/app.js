@@ -61,6 +61,7 @@ class CallingApp {
         this.pendingIceCandidates = new Map(); // Map<clientId, ICECandidate[]>
 
         this.videosContainer = null;
+        this.layoutMode = localStorage.getItem('layoutMode') || 'auto'; // grid, spotlight, sidebar, auto
 
         this.initUI();
         this.connectWebSocket();
@@ -82,6 +83,26 @@ class CallingApp {
         document.getElementById('end-call-btn').addEventListener('click', () => this.endCall());
         document.getElementById('copy-link-btn').addEventListener('click', () => this.copyLink());
         document.getElementById('share-telegram-btn').addEventListener('click', () => this.shareTelegram());
+
+        // Layout controls
+        document.getElementById('layout-btn').addEventListener('click', () => this.toggleLayoutSelector());
+
+        // Layout options
+        document.querySelectorAll('.layout-option').forEach(option => {
+            option.addEventListener('click', (e) => {
+                const layout = e.currentTarget.dataset.layout;
+                this.setLayout(layout);
+            });
+        });
+
+        // Close layout selector when clicking outside
+        document.addEventListener('click', (e) => {
+            const layoutSelector = document.getElementById('layout-selector');
+            const layoutBtn = document.getElementById('layout-btn');
+            if (!layoutSelector.contains(e.target) && !layoutBtn.contains(e.target)) {
+                layoutSelector.classList.add('hidden');
+            }
+        });
 
         // Video container
         this.videosContainer = document.getElementById('videos-container');
@@ -225,6 +246,11 @@ class CallingApp {
             document.getElementById('current-room-id').textContent = this.roomId;
             this.updateConnectionStatus('Ожидание участников...');
 
+            // Initialize layout selector
+            document.querySelectorAll('.layout-option').forEach(option => {
+                option.classList.toggle('selected', option.dataset.layout === this.layoutMode);
+            });
+
             // Update URL
             const newUrl = `${window.location.origin}?room=${this.roomId}`;
             window.history.pushState({}, '', newUrl);
@@ -280,6 +306,50 @@ class CallingApp {
     updateGridLayout() {
         const count = this.videosContainer.children.length;
         this.videosContainer.setAttribute('data-participants', count);
+
+        // Update layout based on mode
+        const effectiveLayout = this.getEffectiveLayout(count);
+        this.videosContainer.setAttribute('data-layout', effectiveLayout);
+    }
+
+    getEffectiveLayout(participantCount) {
+        if (this.layoutMode === 'auto') {
+            // Auto mode: smart selection based on participant count
+            if (participantCount === 1) return 'grid';
+            if (participantCount === 2) return 'grid';
+            if (participantCount >= 3) return 'spotlight';
+        }
+        return this.layoutMode;
+    }
+
+    toggleLayoutSelector() {
+        const selector = document.getElementById('layout-selector');
+        selector.classList.toggle('hidden');
+    }
+
+    setLayout(layout) {
+        this.layoutMode = layout;
+        localStorage.setItem('layoutMode', layout);
+
+        // Update selected option in UI
+        document.querySelectorAll('.layout-option').forEach(option => {
+            option.classList.toggle('selected', option.dataset.layout === layout);
+        });
+
+        // Apply layout
+        this.updateGridLayout();
+
+        // Hide selector
+        document.getElementById('layout-selector').classList.add('hidden');
+
+        // Show toast
+        const layoutNames = {
+            'grid': 'Сетка',
+            'spotlight': 'Фокус',
+            'sidebar': 'Сайдбар',
+            'auto': 'Авто'
+        };
+        this.showToast(`Режим: ${layoutNames[layout]}`);
     }
 
     createPeerConnection(remoteClientId) {
