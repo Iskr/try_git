@@ -354,6 +354,19 @@ class CallingApp {
                 if (this.participants.size < MAX_PARTICIPANTS) {
                     this.participants.set(message.clientId, { id: message.clientId, name: `Участник ${message.clientId.substr(0, 4)}` });
                     this.updateConnectionStatus(`${this.participants.size} участников`);
+
+                    // If encryption is enabled, share key with new participant
+                    if (this.isEncryptionEnabled) {
+                        const keyData = await this.frameCryptor.exportKey();
+                        const keyArray = Array.from(keyData);
+                        this.ws.send(JSON.stringify({
+                            type: 'encryption-key',
+                            keyData: keyArray,
+                            targetId: message.clientId
+                        }));
+                        console.log('Sent encryption key to new participant:', message.clientId);
+                    }
+
                     // New peer will create offer to us, we'll respond with answer
                 } else {
                     console.warn('Max participants reached');
@@ -885,8 +898,38 @@ class CallingApp {
             const keyData = new Uint8Array(message.keyData);
             await this.frameCryptor.setKey(keyData);
 
+            // Enable encryption
+            this.frameCryptor.enable();
+            this.isEncryptionEnabled = true;
+
+            // Update UI
+            const btn = document.getElementById('toggle-encryption-btn');
+            const encryptionOn = btn.querySelector('.encryption-on');
+            const encryptionOff = btn.querySelector('.encryption-off');
+            const indicator = document.getElementById('encryption-indicator');
+
+            btn.classList.add('active');
+            encryptionOn.classList.remove('hidden');
+            encryptionOff.classList.add('hidden');
+            indicator.classList.remove('hidden');
+
+            // Setup transforms for all existing connections
+            this.peerConnections.forEach((pc, clientId) => {
+                const senders = pc.getSenders();
+                senders.forEach(sender => {
+                    if (sender.track) {
+                        this.frameCryptor.setupSenderTransform(sender, sender.track.id);
+                    }
+                });
+
+                const receivers = pc.getReceivers();
+                receivers.forEach(receiver => {
+                    this.frameCryptor.setupReceiverTransform(receiver);
+                });
+            });
+
             console.log('Encryption key received from:', message.senderId);
-            this.showToast('🔑 Ключ шифрования получен');
+            this.showToast('🔒 Шифрование включено');
         } catch (error) {
             console.error('Error handling encryption key:', error);
             this.showToast('Ошибка получения ключа шифрования');
