@@ -146,7 +146,8 @@ wss.on('connection', (ws) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`Calling service running on port ${PORT}`);
-  console.log(`Open http://localhost:${PORT} in your browser`);
+  console.log(`Server ready to accept connections`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
 });
