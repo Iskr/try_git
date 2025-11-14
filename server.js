@@ -10,6 +10,15 @@ const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
 
+// Health check endpoint for monitoring
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    rooms: rooms.size
+  });
+});
+
 // Serve static files from public directory
 app.use(express.static('public'));
 
