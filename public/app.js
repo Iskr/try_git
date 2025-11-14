@@ -1,9 +1,31 @@
 // WebRTC Configuration
 const config = {
     iceServers: [
+        // STUN servers
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-    ]
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+
+        // Public TURN servers (for NAT traversal)
+        {
+            urls: 'turn:openrelay.metered.ca:80',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turn:openrelay.metered.ca:443',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        },
+        {
+            urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        }
+    ],
+    iceCandidatePoolSize: 10
 };
 
 class CallingApp {
@@ -199,21 +221,52 @@ class CallingApp {
         // Handle ICE candidates
         this.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
+                console.log('Sending ICE candidate:', event.candidate.type, event.candidate.candidate);
                 this.ws.send(JSON.stringify({
                     type: 'ice-candidate',
                     candidate: event.candidate,
                     targetId: remoteClientId
                 }));
+            } else {
+                console.log('All ICE candidates sent');
+            }
+        };
+
+        // Handle ICE connection state
+        this.peerConnection.oniceconnectionstatechange = () => {
+            console.log('ICE connection state:', this.peerConnection.iceConnectionState);
+
+            switch (this.peerConnection.iceConnectionState) {
+                case 'connected':
+                case 'completed':
+                    this.updateConnectionStatus('Подключено', true);
+                    break;
+                case 'failed':
+                    console.error('ICE connection failed. Trying ICE restart...');
+                    this.updateConnectionStatus('Переподключение...');
+                    // Try ICE restart
+                    this.restartIce();
+                    break;
+                case 'disconnected':
+                    this.updateConnectionStatus('Соединение потеряно...');
+                    break;
+                case 'checking':
+                    this.updateConnectionStatus('Подключение...');
+                    break;
             }
         };
 
         // Handle connection state
         this.peerConnection.onconnectionstatechange = () => {
             console.log('Connection state:', this.peerConnection.connectionState);
-            if (this.peerConnection.connectionState === 'disconnected' ||
-                this.peerConnection.connectionState === 'failed') {
-                this.handlePeerLeft();
+            if (this.peerConnection.connectionState === 'failed') {
+                this.showToast('Не удалось установить соединение. Попробуйте пересоздать звонок.');
             }
+        };
+
+        // Handle ICE gathering state
+        this.peerConnection.onicegatheringstatechange = () => {
+            console.log('ICE gathering state:', this.peerConnection.iceGatheringState);
         };
 
         return this.peerConnection;
@@ -324,6 +377,27 @@ class CallingApp {
             }
 
             this.pendingIceCandidates = [];
+        }
+    }
+
+    async restartIce() {
+        if (!this.peerConnection || !this.remoteClientId) {
+            return;
+        }
+
+        console.log('Attempting ICE restart...');
+
+        try {
+            const offer = await this.peerConnection.createOffer({ iceRestart: true });
+            await this.peerConnection.setLocalDescription(offer);
+
+            this.ws.send(JSON.stringify({
+                type: 'offer',
+                offer: offer,
+                targetId: this.remoteClientId
+            }));
+        } catch (error) {
+            console.error('Error during ICE restart:', error);
         }
     }
 
