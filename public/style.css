@@ -225,6 +225,8 @@ h1 {
     backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--border-color);
     box-shadow: var(--shadow-sm);
+    position: relative;
+    z-index: 50;
 }
 
 .room-id-display {
@@ -286,7 +288,7 @@ h1 {
     border-radius: var(--radius-md);
     box-shadow: var(--shadow-xl);
     padding: 8px;
-    z-index: 100;
+    z-index: 200;
     min-width: 180px;
     animation: slideDown 0.2s ease;
     border: 1px solid var(--border-color);
@@ -402,6 +404,7 @@ h1 {
     transform: scale(1.02);
     box-shadow: var(--shadow-lg);
     z-index: 10;
+    position: relative;
 }
 
 .video-wrapper video {
