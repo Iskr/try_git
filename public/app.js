@@ -1328,10 +1328,10 @@ class CallingApp {
         // Position popup near the button, ensuring it stays within screen bounds
         const rect = buttonElement.getBoundingClientRect();
         // Popup dimensions accounting for rotated slider with margins
-        const popupWidth = 140; // 100px min-width + 20px padding * 2
+        const popupWidth = 90; // narrow popup for vertical slider + padding
         const popupHeight = 310; // 180px slider + margins + icon + value + padding
 
-        let left = rect.left - 30;
+        let left = rect.left - 15;
         let top = rect.bottom + 10;
 
         // Check if popup goes off the right edge
