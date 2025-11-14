@@ -48,6 +48,190 @@ const config = {
 
 const MAX_PARTICIPANTS = 5;
 
+// Frame Encryption using Web Crypto API and Insertable Streams
+class FrameCryptor {
+    constructor() {
+        this.encryptionKey = null;
+        this.encryptionEnabled = false;
+        this.senderTransforms = new Map(); // Map<trackId, TransformStream>
+        this.receiverTransforms = new Map(); // Map<trackId, TransformStream>
+        this.frameCounters = new Map(); // Map<trackId, counter> for IV generation
+    }
+
+    async generateKey() {
+        // Generate AES-GCM 128-bit key
+        this.encryptionKey = await crypto.subtle.generateKey(
+            { name: 'AES-GCM', length: 128 },
+            true,
+            ['encrypt', 'decrypt']
+        );
+        console.log('Encryption key generated');
+        return this.encryptionKey;
+    }
+
+    async setKey(keyData) {
+        // Import key from raw data
+        this.encryptionKey = await crypto.subtle.importKey(
+            'raw',
+            keyData,
+            { name: 'AES-GCM', length: 128 },
+            true,
+            ['encrypt', 'decrypt']
+        );
+        console.log('Encryption key imported');
+    }
+
+    async exportKey() {
+        if (!this.encryptionKey) {
+            await this.generateKey();
+        }
+        const exported = await crypto.subtle.exportKey('raw', this.encryptionKey);
+        return new Uint8Array(exported);
+    }
+
+    enable() {
+        this.encryptionEnabled = true;
+        console.log('Encryption enabled');
+    }
+
+    disable() {
+        this.encryptionEnabled = false;
+        console.log('Encryption disabled');
+    }
+
+    getIV(trackId, counter) {
+        // Generate 12-byte IV (nonce) for AES-GCM
+        // Format: [trackId hash (8 bytes)] + [counter (4 bytes)]
+        const iv = new Uint8Array(12);
+
+        // Simple hash of trackId
+        const hash = trackId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+        const view = new DataView(iv.buffer);
+        view.setUint32(0, hash);
+        view.setUint32(4, hash >> 8);
+        view.setUint32(8, counter);
+
+        return iv;
+    }
+
+    async encryptFrame(encodedFrame, controller, trackId) {
+        if (!this.encryptionEnabled || !this.encryptionKey) {
+            controller.enqueue(encodedFrame);
+            return;
+        }
+
+        try {
+            // Get frame data
+            const data = new Uint8Array(encodedFrame.data);
+
+            // Get or initialize counter
+            if (!this.frameCounters.has(trackId)) {
+                this.frameCounters.set(trackId, 0);
+            }
+            const counter = this.frameCounters.get(trackId);
+            this.frameCounters.set(trackId, counter + 1);
+
+            // Generate IV
+            const iv = this.getIV(trackId, counter);
+
+            // Encrypt
+            const encrypted = await crypto.subtle.encrypt(
+                { name: 'AES-GCM', iv: iv },
+                this.encryptionKey,
+                data
+            );
+
+            // Create new frame with encrypted data + IV prepended
+            const newData = new Uint8Array(12 + encrypted.byteLength);
+            newData.set(iv, 0);
+            newData.set(new Uint8Array(encrypted), 12);
+
+            encodedFrame.data = newData.buffer;
+            controller.enqueue(encodedFrame);
+        } catch (error) {
+            console.error('Encryption error:', error);
+            controller.enqueue(encodedFrame);
+        }
+    }
+
+    async decryptFrame(encodedFrame, controller) {
+        if (!this.encryptionEnabled || !this.encryptionKey) {
+            controller.enqueue(encodedFrame);
+            return;
+        }
+
+        try {
+            const data = new Uint8Array(encodedFrame.data);
+
+            // Extract IV (first 12 bytes)
+            const iv = data.slice(0, 12);
+            const encryptedData = data.slice(12);
+
+            // Decrypt
+            const decrypted = await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: iv },
+                this.encryptionKey,
+                encryptedData
+            );
+
+            encodedFrame.data = decrypted;
+            controller.enqueue(encodedFrame);
+        } catch (error) {
+            console.error('Decryption error:', error);
+            // Skip frame if decryption fails
+        }
+    }
+
+    setupSenderTransform(sender, trackId) {
+        if (!sender.createEncodedStreams) {
+            console.warn('Insertable Streams not supported');
+            return;
+        }
+
+        const streams = sender.createEncodedStreams();
+        const transformStream = new TransformStream({
+            transform: async (encodedFrame, controller) => {
+                await this.encryptFrame(encodedFrame, controller, trackId);
+            }
+        });
+
+        streams.readable
+            .pipeThrough(transformStream)
+            .pipeTo(streams.writable);
+
+        this.senderTransforms.set(trackId, transformStream);
+        console.log('Sender transform setup for:', trackId);
+    }
+
+    setupReceiverTransform(receiver) {
+        if (!receiver.createEncodedStreams) {
+            console.warn('Insertable Streams not supported');
+            return;
+        }
+
+        const streams = receiver.createEncodedStreams();
+        const transformStream = new TransformStream({
+            transform: async (encodedFrame, controller) => {
+                await this.decryptFrame(encodedFrame, controller);
+            }
+        });
+
+        streams.readable
+            .pipeThrough(transformStream)
+            .pipeTo(streams.writable);
+
+        const trackId = receiver.track?.id || 'unknown';
+        this.receiverTransforms.set(trackId, transformStream);
+        console.log('Receiver transform setup for:', trackId);
+    }
+
+    clearTransforms() {
+        this.senderTransforms.clear();
+        this.receiverTransforms.clear();
+        this.frameCounters.clear();
+    }
+}
+
 class CallingApp {
     constructor() {
         this.ws = null;
@@ -62,6 +246,9 @@ class CallingApp {
 
         this.videosContainer = null;
         this.layoutMode = localStorage.getItem('layoutMode') || 'auto'; // grid, spotlight, sidebar, auto
+
+        this.frameCryptor = new FrameCryptor();
+        this.isEncryptionEnabled = false;
 
         this.initUI();
         this.connectWebSocket();
@@ -80,6 +267,7 @@ class CallingApp {
         // Call screen controls
         document.getElementById('toggle-audio-btn').addEventListener('click', () => this.toggleAudio());
         document.getElementById('toggle-video-btn').addEventListener('click', () => this.toggleVideo());
+        document.getElementById('toggle-encryption-btn').addEventListener('click', () => this.toggleEncryption());
         document.getElementById('end-call-btn').addEventListener('click', () => this.endCall());
         document.getElementById('copy-link-btn').addEventListener('click', () => this.copyLink());
         document.getElementById('share-telegram-btn').addEventListener('click', () => this.shareTelegram());
@@ -182,6 +370,10 @@ class CallingApp {
 
             case 'ice-candidate':
                 await this.handleIceCandidate(message);
+                break;
+
+            case 'encryption-key':
+                await this.handleEncryptionKey(message);
                 break;
 
             case 'peer-left':
@@ -356,9 +548,14 @@ class CallingApp {
         const pc = new RTCPeerConnection(config);
         this.peerConnections.set(remoteClientId, pc);
 
-        // Add local tracks
+        // Add local tracks and setup encryption
         this.localStream.getTracks().forEach(track => {
-            pc.addTrack(track, this.localStream);
+            const sender = pc.addTrack(track, this.localStream);
+
+            // Setup encryption transform for sender
+            if (this.isEncryptionEnabled) {
+                this.frameCryptor.setupSenderTransform(sender, track.id);
+            }
         });
 
         // Handle remote stream
@@ -366,6 +563,11 @@ class CallingApp {
             console.log('Received remote track from:', remoteClientId);
             this.addVideoStream(remoteClientId, event.streams[0], false);
             this.updateConnectionStatus(`${this.participants.size} участников`);
+
+            // Setup encryption transform for receiver
+            if (this.isEncryptionEnabled && event.receiver) {
+                this.frameCryptor.setupReceiverTransform(event.receiver);
+            }
         };
 
         // Handle ICE candidates
@@ -617,6 +819,80 @@ class CallingApp {
         }
     }
 
+    async toggleEncryption() {
+        this.isEncryptionEnabled = !this.isEncryptionEnabled;
+
+        const btn = document.getElementById('toggle-encryption-btn');
+        const encryptionOn = btn.querySelector('.encryption-on');
+        const encryptionOff = btn.querySelector('.encryption-off');
+        const indicator = document.getElementById('encryption-indicator');
+
+        btn.classList.toggle('active', this.isEncryptionEnabled);
+        encryptionOn.classList.toggle('hidden', !this.isEncryptionEnabled);
+        encryptionOff.classList.toggle('hidden', this.isEncryptionEnabled);
+        indicator.classList.toggle('hidden', !this.isEncryptionEnabled);
+
+        if (this.isEncryptionEnabled) {
+            // Enable encryption
+            this.frameCryptor.enable();
+
+            // Generate and share encryption key
+            const keyData = await this.frameCryptor.exportKey();
+            await this.broadcastEncryptionKey(keyData);
+
+            // Setup transforms for all existing connections
+            this.peerConnections.forEach((pc, clientId) => {
+                const senders = pc.getSenders();
+                senders.forEach(sender => {
+                    if (sender.track) {
+                        this.frameCryptor.setupSenderTransform(sender, sender.track.id);
+                    }
+                });
+
+                const receivers = pc.getReceivers();
+                receivers.forEach(receiver => {
+                    this.frameCryptor.setupReceiverTransform(receiver);
+                });
+            });
+
+            this.showToast('🔒 Шифрование включено');
+        } else {
+            // Disable encryption
+            this.frameCryptor.disable();
+            this.frameCryptor.clearTransforms();
+
+            this.showToast('🔓 Шифрование выключено');
+        }
+    }
+
+    async broadcastEncryptionKey(keyData) {
+        // Send encryption key to all participants
+        const keyArray = Array.from(keyData);
+
+        this.participants.forEach((participant, clientId) => {
+            if (clientId !== this.clientId) {
+                this.ws.send(JSON.stringify({
+                    type: 'encryption-key',
+                    keyData: keyArray,
+                    targetId: clientId
+                }));
+            }
+        });
+    }
+
+    async handleEncryptionKey(message) {
+        try {
+            const keyData = new Uint8Array(message.keyData);
+            await this.frameCryptor.setKey(keyData);
+
+            console.log('Encryption key received from:', message.senderId);
+            this.showToast('🔑 Ключ шифрования получен');
+        } catch (error) {
+            console.error('Error handling encryption key:', error);
+            this.showToast('Ошибка получения ключа шифрования');
+        }
+    }
+
     endCall() {
         // Stop local stream
         if (this.localStream) {
@@ -637,6 +913,11 @@ class CallingApp {
                 roomId: this.roomId
             }));
         }
+
+        // Reset encryption
+        this.isEncryptionEnabled = false;
+        this.frameCryptor.disable();
+        this.frameCryptor.clearTransforms();
 
         // Reset state
         this.roomId = null;
