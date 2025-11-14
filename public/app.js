@@ -46,17 +46,21 @@ const config = {
     rtcpMuxPolicy: 'require'
 };
 
+const MAX_PARTICIPANTS = 5;
+
 class CallingApp {
     constructor() {
         this.ws = null;
-        this.peerConnection = null;
+        this.peerConnections = new Map(); // Map<clientId, RTCPeerConnection>
         this.localStream = null;
         this.roomId = null;
         this.clientId = null;
-        this.remoteClientId = null;
+        this.participants = new Map(); // Map<clientId, participantInfo>
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
-        this.pendingIceCandidates = []; // Buffer for ICE candidates
+        this.pendingIceCandidates = new Map(); // Map<clientId, ICECandidate[]>
+
+        this.videosContainer = null;
 
         this.initUI();
         this.connectWebSocket();
@@ -79,9 +83,8 @@ class CallingApp {
         document.getElementById('copy-link-btn').addEventListener('click', () => this.copyLink());
         document.getElementById('share-telegram-btn').addEventListener('click', () => this.shareTelegram());
 
-        // Video elements
-        this.localVideo = document.getElementById('local-video');
-        this.remoteVideo = document.getElementById('remote-video');
+        // Video container
+        this.videosContainer = document.getElementById('videos-container');
 
         // Check URL for room ID
         const urlParams = new URLSearchParams(window.location.search);
@@ -127,13 +130,25 @@ class CallingApp {
             case 'joined':
                 this.clientId = message.clientId;
                 this.roomId = message.roomId;
+                this.participants.set(this.clientId, { id: this.clientId, name: 'Вы' });
                 await this.startCall();
+                // Connect to existing participants
+                if (message.participants && message.participants.length > 0) {
+                    for (const participantId of message.participants) {
+                        this.participants.set(participantId, { id: participantId, name: `Участник ${participantId.substr(0, 4)}` });
+                        await this.createOffer(participantId);
+                    }
+                }
                 break;
 
             case 'peer-joined':
-                this.remoteClientId = message.clientId;
-                await this.createOffer(message.clientId);
-                this.updateConnectionStatus('Подключение к собеседнику...');
+                if (this.participants.size < MAX_PARTICIPANTS) {
+                    this.participants.set(message.clientId, { id: message.clientId, name: `Участник ${message.clientId.substr(0, 4)}` });
+                    this.updateConnectionStatus(`${this.participants.size} участников`);
+                    // New peer will create offer to us, we'll respond with answer
+                } else {
+                    console.warn('Max participants reached');
+                }
                 break;
 
             case 'offer':
@@ -149,7 +164,7 @@ class CallingApp {
                 break;
 
             case 'peer-left':
-                this.handlePeerLeft();
+                this.handlePeerLeft(message.clientId);
                 break;
         }
     }
@@ -199,7 +214,8 @@ class CallingApp {
                 }
             });
 
-            this.localVideo.srcObject = this.localStream;
+            // Add local video to grid
+            this.addVideoStream(this.clientId, this.localStream, true);
 
             // Show call screen
             this.homeScreen.classList.remove('active');
@@ -207,7 +223,7 @@ class CallingApp {
 
             // Update UI
             document.getElementById('current-room-id').textContent = this.roomId;
-            this.updateConnectionStatus('Ожидание собеседника...');
+            this.updateConnectionStatus('Ожидание участников...');
 
             // Update URL
             const newUrl = `${window.location.origin}?room=${this.roomId}`;
@@ -220,82 +236,115 @@ class CallingApp {
         }
     }
 
+    addVideoStream(clientId, stream, isLocal = false) {
+        // Remove existing video if present
+        this.removeVideoStream(clientId);
+
+        const wrapper = document.createElement('div');
+        wrapper.className = `video-wrapper${isLocal ? ' local-video' : ''}`;
+        wrapper.id = `video-wrapper-${clientId}`;
+
+        const video = document.createElement('video');
+        video.id = `video-${clientId}`;
+        video.srcObject = stream;
+        video.autoplay = true;
+        video.playsinline = true;
+        if (isLocal) {
+            video.muted = true;
+        }
+
+        const label = document.createElement('div');
+        label.className = 'video-label';
+        const participant = this.participants.get(clientId);
+        label.textContent = participant ? participant.name : (isLocal ? 'Вы' : 'Участник');
+
+        wrapper.appendChild(video);
+        wrapper.appendChild(label);
+        this.videosContainer.appendChild(wrapper);
+
+        // Update grid layout
+        this.updateGridLayout();
+
+        // Try to play video
+        video.play().catch(e => console.log('Autoplay prevented:', e));
+    }
+
+    removeVideoStream(clientId) {
+        const wrapper = document.getElementById(`video-wrapper-${clientId}`);
+        if (wrapper) {
+            wrapper.remove();
+        }
+        this.updateGridLayout();
+    }
+
+    updateGridLayout() {
+        const count = this.videosContainer.children.length;
+        this.videosContainer.setAttribute('data-participants', count);
+    }
+
     createPeerConnection(remoteClientId) {
-        this.peerConnection = new RTCPeerConnection(config);
-        this.remoteClientId = remoteClientId;
+        const pc = new RTCPeerConnection(config);
+        this.peerConnections.set(remoteClientId, pc);
 
         // Add local tracks
         this.localStream.getTracks().forEach(track => {
-            this.peerConnection.addTrack(track, this.localStream);
+            pc.addTrack(track, this.localStream);
         });
 
         // Handle remote stream
-        this.peerConnection.ontrack = async (event) => {
-            console.log('Received remote track');
-            this.remoteVideo.srcObject = event.streams[0];
-
-            // Try to play with error handling for autoplay policy
-            try {
-                await this.remoteVideo.play();
-                this.updateConnectionStatus('Подключено', true);
-            } catch (error) {
-                console.log('Autoplay prevented, waiting for user interaction');
-                // Video will play when user interacts with the page
-            }
+        pc.ontrack = (event) => {
+            console.log('Received remote track from:', remoteClientId);
+            this.addVideoStream(remoteClientId, event.streams[0], false);
+            this.updateConnectionStatus(`${this.participants.size} участников`);
         };
 
         // Handle ICE candidates
-        this.peerConnection.onicecandidate = (event) => {
+        pc.onicecandidate = (event) => {
             if (event.candidate) {
-                console.log('Sending ICE candidate:', event.candidate.type, event.candidate.candidate);
+                console.log('Sending ICE candidate to:', remoteClientId, event.candidate.type);
                 this.ws.send(JSON.stringify({
                     type: 'ice-candidate',
                     candidate: event.candidate,
                     targetId: remoteClientId
                 }));
             } else {
-                console.log('All ICE candidates sent');
+                console.log('All ICE candidates sent to:', remoteClientId);
             }
         };
 
         // Handle ICE connection state
-        this.peerConnection.oniceconnectionstatechange = () => {
-            console.log('ICE connection state:', this.peerConnection.iceConnectionState);
+        pc.oniceconnectionstatechange = () => {
+            console.log(`ICE connection state (${remoteClientId}):`, pc.iceConnectionState);
 
-            switch (this.peerConnection.iceConnectionState) {
+            switch (pc.iceConnectionState) {
                 case 'connected':
                 case 'completed':
-                    this.updateConnectionStatus('Подключено', true);
+                    this.updateConnectionStatus(`${this.participants.size} участников`, true);
                     break;
                 case 'failed':
-                    console.error('ICE connection failed. Trying ICE restart...');
-                    this.updateConnectionStatus('Переподключение...');
-                    // Try ICE restart
-                    this.restartIce();
+                    console.error('ICE connection failed for:', remoteClientId);
+                    this.restartIce(remoteClientId);
                     break;
                 case 'disconnected':
-                    this.updateConnectionStatus('Соединение потеряно...');
-                    break;
-                case 'checking':
-                    this.updateConnectionStatus('Подключение...');
+                    this.updateConnectionStatus('Переподключение...');
                     break;
             }
         };
 
         // Handle connection state
-        this.peerConnection.onconnectionstatechange = () => {
-            console.log('Connection state:', this.peerConnection.connectionState);
-            if (this.peerConnection.connectionState === 'failed') {
-                this.showToast('Не удалось установить соединение. Попробуйте пересоздать звонок.');
+        pc.onconnectionstatechange = () => {
+            console.log(`Connection state (${remoteClientId}):`, pc.connectionState);
+            if (pc.connectionState === 'failed') {
+                this.showToast('Не удалось подключиться к участнику');
             }
         };
 
         // Handle ICE gathering state
-        this.peerConnection.onicegatheringstatechange = () => {
-            console.log('ICE gathering state:', this.peerConnection.iceGatheringState);
+        pc.onicegatheringstatechange = () => {
+            console.log(`ICE gathering state (${remoteClientId}):`, pc.iceGatheringState);
         };
 
-        return this.peerConnection;
+        return pc;
     }
 
     async createOffer(remoteClientId) {
@@ -331,7 +380,7 @@ class CallingApp {
                         autoGainControl: true
                     }
                 });
-                this.localVideo.srcObject = this.localStream;
+                this.addVideoStream(this.clientId, this.localStream, true);
             } catch (error) {
                 console.error('Error accessing media devices:', error);
                 this.showToast('Не удалось получить доступ к камере/микрофону');
@@ -345,7 +394,7 @@ class CallingApp {
             await pc.setRemoteDescription(new RTCSessionDescription(message.offer));
 
             // Process any pending ICE candidates
-            await this.processPendingIceCandidates();
+            await this.processPendingIceCandidates(message.senderId);
 
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
@@ -362,10 +411,11 @@ class CallingApp {
 
     async handleAnswer(message) {
         try {
-            await this.peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
-
-            // Process any pending ICE candidates
-            await this.processPendingIceCandidates();
+            const pc = this.peerConnections.get(message.senderId);
+            if (pc) {
+                await pc.setRemoteDescription(new RTCSessionDescription(message.answer));
+                await this.processPendingIceCandidates(message.senderId);
+            }
         } catch (error) {
             console.error('Error handling answer:', error);
         }
@@ -373,16 +423,20 @@ class CallingApp {
 
     async handleIceCandidate(message) {
         try {
-            if (this.peerConnection) {
+            const pc = this.peerConnections.get(message.senderId);
+            if (pc) {
                 const candidate = new RTCIceCandidate(message.candidate);
 
                 // Check if remote description is set
-                if (this.peerConnection.remoteDescription) {
-                    await this.peerConnection.addIceCandidate(candidate);
+                if (pc.remoteDescription) {
+                    await pc.addIceCandidate(candidate);
                 } else {
                     // Buffer the candidate until remote description is set
-                    this.pendingIceCandidates.push(candidate);
-                    console.log('Buffered ICE candidate, total pending:', this.pendingIceCandidates.length);
+                    if (!this.pendingIceCandidates.has(message.senderId)) {
+                        this.pendingIceCandidates.set(message.senderId, []);
+                    }
+                    this.pendingIceCandidates.get(message.senderId).push(candidate);
+                    console.log(`Buffered ICE candidate for ${message.senderId}`);
                 }
             }
         } catch (error) {
@@ -390,55 +444,67 @@ class CallingApp {
         }
     }
 
-    async processPendingIceCandidates() {
-        if (this.pendingIceCandidates.length > 0 && this.peerConnection) {
-            console.log('Processing', this.pendingIceCandidates.length, 'pending ICE candidates');
+    async processPendingIceCandidates(clientId) {
+        const candidates = this.pendingIceCandidates.get(clientId);
+        if (candidates && candidates.length > 0) {
+            console.log(`Processing ${candidates.length} pending ICE candidates for ${clientId}`);
 
-            for (const candidate of this.pendingIceCandidates) {
-                try {
-                    await this.peerConnection.addIceCandidate(candidate);
-                } catch (error) {
-                    console.error('Error adding pending ICE candidate:', error);
+            const pc = this.peerConnections.get(clientId);
+            if (pc) {
+                for (const candidate of candidates) {
+                    try {
+                        await pc.addIceCandidate(candidate);
+                    } catch (error) {
+                        console.error('Error adding pending ICE candidate:', error);
+                    }
                 }
             }
 
-            this.pendingIceCandidates = [];
+            this.pendingIceCandidates.delete(clientId);
         }
     }
 
-    async restartIce() {
-        if (!this.peerConnection || !this.remoteClientId) {
-            return;
-        }
+    async restartIce(clientId) {
+        const pc = this.peerConnections.get(clientId);
+        if (!pc) return;
 
-        console.log('Attempting ICE restart...');
+        console.log(`Attempting ICE restart for ${clientId}...`);
 
         try {
-            const offer = await this.peerConnection.createOffer({ iceRestart: true });
-            await this.peerConnection.setLocalDescription(offer);
+            const offer = await pc.createOffer({ iceRestart: true });
+            await pc.setLocalDescription(offer);
 
             this.ws.send(JSON.stringify({
                 type: 'offer',
                 offer: offer,
-                targetId: this.remoteClientId
+                targetId: clientId
             }));
         } catch (error) {
             console.error('Error during ICE restart:', error);
         }
     }
 
-    handlePeerLeft() {
-        this.showToast('Собеседник завершил звонок');
-        this.updateConnectionStatus('Собеседник отключился');
+    handlePeerLeft(clientId) {
+        console.log('Peer left:', clientId);
 
-        if (this.peerConnection) {
-            this.peerConnection.close();
-            this.peerConnection = null;
+        // Close peer connection
+        const pc = this.peerConnections.get(clientId);
+        if (pc) {
+            pc.close();
+            this.peerConnections.delete(clientId);
         }
 
-        this.remoteVideo.srcObject = null;
-        this.remoteClientId = null;
-        this.pendingIceCandidates = [];
+        // Remove video
+        this.removeVideoStream(clientId);
+
+        // Remove from participants
+        this.participants.delete(clientId);
+
+        // Clean up pending candidates
+        this.pendingIceCandidates.delete(clientId);
+
+        this.showToast('Участник покинул звонок');
+        this.updateConnectionStatus(`${this.participants.size} участников`);
     }
 
     toggleAudio() {
@@ -455,6 +521,12 @@ class CallingApp {
             btn.classList.toggle('active', this.isAudioEnabled);
             audioOn.classList.toggle('hidden', !this.isAudioEnabled);
             audioOff.classList.toggle('hidden', this.isAudioEnabled);
+
+            // Update label
+            const label = document.querySelector(`#video-wrapper-${this.clientId} .video-label`);
+            if (label) {
+                label.classList.toggle('muted', !this.isAudioEnabled);
+            }
         }
     }
 
@@ -482,11 +554,11 @@ class CallingApp {
             this.localStream = null;
         }
 
-        // Close peer connection
-        if (this.peerConnection) {
-            this.peerConnection.close();
-            this.peerConnection = null;
-        }
+        // Close all peer connections
+        this.peerConnections.forEach((pc, clientId) => {
+            pc.close();
+        });
+        this.peerConnections.clear();
 
         // Notify server
         if (this.ws && this.roomId) {
@@ -499,14 +571,16 @@ class CallingApp {
         // Reset state
         this.roomId = null;
         this.clientId = null;
-        this.remoteClientId = null;
+        this.participants.clear();
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
-        this.pendingIceCandidates = [];
+        this.pendingIceCandidates.clear();
+
+        // Clear videos
+        this.videosContainer.innerHTML = '';
+        this.updateGridLayout();
 
         // Update UI
-        this.localVideo.srcObject = null;
-        this.remoteVideo.srcObject = null;
         this.callScreen.classList.remove('active');
         this.homeScreen.classList.add('active');
 
