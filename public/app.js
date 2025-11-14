@@ -255,6 +255,11 @@ class CallingApp {
         this.reactionCounts = this.loadReactionCounts();
         this.audioContext = null;
 
+        // Volume control system
+        this.audioContexts = new Map(); // Map<clientId, {context, gainNode, source}>
+        this.volumeSettings = this.loadVolumeSettings();
+        this.currentVolumeTarget = null;
+
         this.initUI();
         this.connectWebSocket();
     }
@@ -302,6 +307,31 @@ class CallingApp {
             const reactionsBtn = document.getElementById('reactions-btn');
             if (!reactionsDropdown.contains(e.target) && !reactionsBtn.contains(e.target)) {
                 reactionsDropdown.classList.add('hidden');
+            }
+
+            // Close volume control when clicking outside
+            const volumeControl = document.getElementById('volume-control');
+            const volumeBtns = document.querySelectorAll('.volume-btn');
+            let clickedVolumeBtn = false;
+            volumeBtns.forEach(btn => {
+                if (btn.contains(e.target)) clickedVolumeBtn = true;
+            });
+            if (!volumeControl.contains(e.target) && !clickedVolumeBtn) {
+                volumeControl.classList.add('hidden');
+            }
+        });
+
+        // Volume slider event listeners
+        const volumeSlider = document.getElementById('volume-slider');
+        const volumeValue = document.getElementById('volume-value');
+
+        volumeSlider.addEventListener('input', (e) => {
+            const value = e.target.value;
+            volumeValue.textContent = value + '%';
+            this.updateVolumeSliderGradient(value);
+
+            if (this.currentVolumeTarget) {
+                this.setParticipantVolume(this.currentVolumeTarget, value / 100);
             }
         });
 
@@ -512,6 +542,34 @@ class CallingApp {
 
         wrapper.appendChild(video);
         wrapper.appendChild(label);
+
+        // Add volume control button for remote participants
+        if (!isLocal) {
+            const volumeBtn = document.createElement('div');
+            volumeBtn.className = 'volume-btn';
+            volumeBtn.innerHTML = '🔊';
+            volumeBtn.title = 'Регулировка громкости';
+            volumeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.showVolumeControl(clientId, volumeBtn);
+            });
+            wrapper.appendChild(volumeBtn);
+
+            // Add volume badge (shown on hover if volume != 100%)
+            const volumeBadge = document.createElement('div');
+            volumeBadge.className = 'volume-badge';
+            volumeBadge.id = `volume-badge-${clientId}`;
+            const savedVolume = this.volumeSettings[clientId] || 1.0;
+            if (savedVolume !== 1.0) {
+                volumeBadge.textContent = Math.round(savedVolume * 100) + '%';
+                volumeBadge.classList.add('visible');
+            }
+            wrapper.appendChild(volumeBadge);
+
+            // Setup audio routing through Web Audio API
+            this.setupVolumeControl(clientId, video, stream);
+        }
+
         this.videosContainer.appendChild(wrapper);
 
         // Update grid layout
@@ -522,6 +580,18 @@ class CallingApp {
     }
 
     removeVideoStream(clientId) {
+        // Clean up audio context
+        const audioSetup = this.audioContexts.get(clientId);
+        if (audioSetup) {
+            try {
+                audioSetup.source.disconnect();
+                audioSetup.gainNode.disconnect();
+            } catch (e) {
+                console.log('Error disconnecting audio nodes:', e);
+            }
+            this.audioContexts.delete(clientId);
+        }
+
         const wrapper = document.getElementById(`video-wrapper-${clientId}`);
         if (wrapper) {
             wrapper.remove();
@@ -1159,6 +1229,120 @@ class CallingApp {
         oscillator.stop(ctx.currentTime + 0.1);
     }
 
+    // Volume Control System
+    loadVolumeSettings() {
+        const saved = localStorage.getItem('volumeSettings');
+        if (saved) {
+            try {
+                return JSON.parse(saved);
+            } catch (e) {
+                console.error('Error loading volume settings:', e);
+            }
+        }
+        return {};
+    }
+
+    saveVolumeSettings() {
+        localStorage.setItem('volumeSettings', JSON.stringify(this.volumeSettings));
+    }
+
+    setupVolumeControl(clientId, videoElement, stream) {
+        try {
+            // Create audio context if needed
+            if (!this.audioContext) {
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            const audioContext = this.audioContext;
+
+            // Mute the video element (we'll route audio through Web Audio API)
+            videoElement.muted = true;
+
+            // Create audio nodes
+            const source = audioContext.createMediaStreamSource(stream);
+            const gainNode = audioContext.createGain();
+
+            // Set initial volume from saved settings
+            const savedVolume = this.volumeSettings[clientId] || 1.0;
+            gainNode.gain.value = savedVolume;
+
+            // Connect audio pipeline
+            source.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            // Store references
+            this.audioContexts.set(clientId, {
+                context: audioContext,
+                source: source,
+                gainNode: gainNode
+            });
+
+            console.log(`Volume control setup for ${clientId}, initial volume: ${savedVolume}`);
+        } catch (error) {
+            console.error('Error setting up volume control:', error);
+            // Fallback: unmute video element
+            videoElement.muted = false;
+        }
+    }
+
+    showVolumeControl(clientId, buttonElement) {
+        const volumeControl = document.getElementById('volume-control');
+        const volumeSlider = document.getElementById('volume-slider');
+        const volumeValue = document.getElementById('volume-value');
+
+        // Get current volume
+        const currentVolume = this.volumeSettings[clientId] || 1.0;
+        const volumePercent = Math.round(currentVolume * 100);
+
+        // Update slider
+        volumeSlider.value = volumePercent;
+        volumeValue.textContent = volumePercent + '%';
+        this.updateVolumeSliderGradient(volumePercent);
+
+        // Position popup near the button
+        const rect = buttonElement.getBoundingClientRect();
+        volumeControl.style.left = (rect.left - 30) + 'px';
+        volumeControl.style.top = (rect.bottom + 10) + 'px';
+
+        // Show popup
+        volumeControl.classList.remove('hidden');
+
+        // Store current target
+        this.currentVolumeTarget = clientId;
+    }
+
+    setParticipantVolume(clientId, volume) {
+        // Update volume in audio context
+        const audioSetup = this.audioContexts.get(clientId);
+        if (audioSetup && audioSetup.gainNode) {
+            audioSetup.gainNode.gain.value = volume;
+        }
+
+        // Save to settings
+        this.volumeSettings[clientId] = volume;
+        this.saveVolumeSettings();
+
+        // Update badge
+        const badge = document.getElementById(`volume-badge-${clientId}`);
+        if (badge) {
+            const percent = Math.round(volume * 100);
+            badge.textContent = percent + '%';
+            if (percent !== 100) {
+                badge.classList.add('visible');
+            } else {
+                badge.classList.remove('visible');
+            }
+        }
+
+        console.log(`Set volume for ${clientId}: ${Math.round(volume * 100)}%`);
+    }
+
+    updateVolumeSliderGradient(value) {
+        const slider = document.getElementById('volume-slider');
+        const percentage = value / 2; // Since max is 200
+        slider.style.background = `linear-gradient(to bottom, var(--primary-color) 0%, var(--primary-color) ${percentage}%, var(--border-color) ${percentage}%, var(--border-color) 100%)`;
+    }
+
     endCall() {
         // Stop local stream
         if (this.localStream) {
@@ -1171,6 +1355,17 @@ class CallingApp {
             pc.close();
         });
         this.peerConnections.clear();
+
+        // Clean up all audio contexts
+        this.audioContexts.forEach((audioSetup, clientId) => {
+            try {
+                audioSetup.source.disconnect();
+                audioSetup.gainNode.disconnect();
+            } catch (e) {
+                console.log('Error disconnecting audio nodes:', e);
+            }
+        });
+        this.audioContexts.clear();
 
         // Notify server
         if (this.ws && this.roomId) {
