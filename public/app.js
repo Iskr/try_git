@@ -1,31 +1,49 @@
 // WebRTC Configuration
 const config = {
     iceServers: [
-        // STUN servers
+        // STUN servers (only 1-2 needed)
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
-        { urls: 'stun:stun3.l.google.com:19302' },
-        { urls: 'stun:stun4.l.google.com:19302' },
 
-        // Public TURN servers (for NAT traversal)
+        // Multiple TURN server options for better reliability
+        // Twilio STUN/TURN (fallback)
         {
-            urls: 'turn:openrelay.metered.ca:80',
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
+            urls: 'stun:global.stun.twilio.com:3478'
         },
+
+        // Free TURN server alternative 1
         {
-            urls: 'turn:openrelay.metered.ca:443',
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
+            urls: [
+                'turn:numb.viagenie.ca',
+                'turn:numb.viagenie.ca:3478'
+            ],
+            username: 'webrtc@live.com',
+            credential: 'muazkh'
         },
+
+        // Free TURN server alternative 2
         {
-            urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+            urls: [
+                'turn:turn.anyfirewall.com:443?transport=tcp',
+            ],
+            username: 'webrtc',
+            credential: 'webrtc'
+        },
+
+        // OpenRelay (may be unstable)
+        {
+            urls: [
+                'turn:openrelay.metered.ca:80',
+                'turn:openrelay.metered.ca:443',
+                'turn:openrelay.metered.ca:443?transport=tcp'
+            ],
             username: 'openrelayproject',
             credential: 'openrelayproject'
         }
     ],
-    iceCandidatePoolSize: 10
+    iceCandidatePoolSize: 10,
+    iceTransportPolicy: 'all', // Try all connection types
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require'
 };
 
 class CallingApp {
@@ -212,10 +230,18 @@ class CallingApp {
         });
 
         // Handle remote stream
-        this.peerConnection.ontrack = (event) => {
+        this.peerConnection.ontrack = async (event) => {
             console.log('Received remote track');
             this.remoteVideo.srcObject = event.streams[0];
-            this.updateConnectionStatus('Подключено', true);
+
+            // Try to play with error handling for autoplay policy
+            try {
+                await this.remoteVideo.play();
+                this.updateConnectionStatus('Подключено', true);
+            } catch (error) {
+                console.log('Autoplay prevented, waiting for user interaction');
+                // Video will play when user interacts with the page
+            }
         };
 
         // Handle ICE candidates
