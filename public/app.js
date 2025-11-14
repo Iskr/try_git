@@ -250,6 +250,16 @@ class CallingApp {
         this.frameCryptor = new FrameCryptor();
         this.isEncryptionEnabled = false;
 
+        // Reactions system
+        this.reactions = ['❤️', '👍', '😂', '😮', '😢', '🔥', '🎉', '👏', '💯', '🚀'];
+        this.reactionCounts = this.loadReactionCounts();
+        this.audioContext = null;
+
+        // Volume control system
+        this.audioContexts = new Map(); // Map<clientId, {context, gainNode, source}>
+        this.volumeSettings = this.loadVolumeSettings();
+        this.currentVolumeTarget = null;
+
         this.initUI();
         this.connectWebSocket();
     }
@@ -268,6 +278,7 @@ class CallingApp {
         document.getElementById('toggle-audio-btn').addEventListener('click', () => this.toggleAudio());
         document.getElementById('toggle-video-btn').addEventListener('click', () => this.toggleVideo());
         document.getElementById('toggle-encryption-btn').addEventListener('click', () => this.toggleEncryption());
+        document.getElementById('reactions-btn').addEventListener('click', () => this.toggleReactionsDropdown());
         document.getElementById('end-call-btn').addEventListener('click', () => this.endCall());
         document.getElementById('copy-link-btn').addEventListener('click', () => this.copyLink());
         document.getElementById('share-telegram-btn').addEventListener('click', () => this.shareTelegram());
@@ -289,6 +300,49 @@ class CallingApp {
             const layoutBtn = document.getElementById('layout-btn');
             if (!layoutSelector.contains(e.target) && !layoutBtn.contains(e.target)) {
                 layoutSelector.classList.add('hidden');
+            }
+
+            // Close reactions dropdown when clicking outside
+            const reactionsDropdown = document.getElementById('reactions-dropdown');
+            const reactionsBtn = document.getElementById('reactions-btn');
+            if (!reactionsDropdown.contains(e.target) && !reactionsBtn.contains(e.target)) {
+                reactionsDropdown.classList.add('hidden');
+            }
+
+            // Close volume control when clicking outside
+            const volumeControl = document.getElementById('volume-control');
+            const volumeBtns = document.querySelectorAll('.volume-btn');
+            let clickedVolumeBtn = false;
+            volumeBtns.forEach(btn => {
+                if (btn.contains(e.target)) clickedVolumeBtn = true;
+            });
+            if (!volumeControl.contains(e.target) && !clickedVolumeBtn) {
+                volumeControl.classList.add('hidden');
+            }
+
+            // Hide video controls when clicking outside video wrappers
+            const videoWrappers = document.querySelectorAll('.video-wrapper');
+            let clickedVideoWrapper = false;
+            videoWrappers.forEach(wrapper => {
+                if (wrapper.contains(e.target)) clickedVideoWrapper = true;
+            });
+            if (!clickedVideoWrapper) {
+                document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
+                    w.classList.remove('show-controls');
+                });
+            }
+        });
+
+        // Volume slider event listeners
+        const volumeSlider = document.getElementById('volume-slider');
+        const volumeValue = document.getElementById('volume-value');
+
+        volumeSlider.addEventListener('input', (e) => {
+            const value = e.target.value;
+            volumeValue.textContent = value + '%';
+
+            if (this.currentVolumeTarget) {
+                this.setParticipantVolume(this.currentVolumeTarget, value / 100);
             }
         });
 
@@ -387,6 +441,14 @@ class CallingApp {
 
             case 'encryption-key':
                 await this.handleEncryptionKey(message);
+                break;
+
+            case 'encryption-disabled':
+                this.handleEncryptionDisabled(message);
+                break;
+
+            case 'reaction':
+                this.handleReaction(message);
                 break;
 
             case 'peer-left':
@@ -491,6 +553,50 @@ class CallingApp {
 
         wrapper.appendChild(video);
         wrapper.appendChild(label);
+
+        // Add volume control button for remote participants
+        if (!isLocal) {
+            // Add click handler to show controls
+            wrapper.addEventListener('click', (e) => {
+                // Toggle controls visibility
+                const wasShowing = wrapper.classList.contains('show-controls');
+
+                // Hide controls on all other videos
+                document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
+                    w.classList.remove('show-controls');
+                });
+
+                // Show controls on this video if it wasn't showing before
+                if (!wasShowing) {
+                    wrapper.classList.add('show-controls');
+                }
+            });
+
+            const volumeBtn = document.createElement('div');
+            volumeBtn.className = 'volume-btn';
+            volumeBtn.innerHTML = '🔊';
+            volumeBtn.title = 'Регулировка громкости';
+            volumeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.showVolumeControl(clientId, volumeBtn);
+            });
+            wrapper.appendChild(volumeBtn);
+
+            // Add volume badge (shown on hover if volume != 100%)
+            const volumeBadge = document.createElement('div');
+            volumeBadge.className = 'volume-badge';
+            volumeBadge.id = `volume-badge-${clientId}`;
+            const savedVolume = this.volumeSettings[clientId] || 1.0;
+            if (savedVolume !== 1.0) {
+                volumeBadge.textContent = Math.round(savedVolume * 100) + '%';
+                volumeBadge.classList.add('visible');
+            }
+            wrapper.appendChild(volumeBadge);
+
+            // Setup audio routing through Web Audio API
+            this.setupVolumeControl(clientId, video, stream);
+        }
+
         this.videosContainer.appendChild(wrapper);
 
         // Update grid layout
@@ -501,6 +607,18 @@ class CallingApp {
     }
 
     removeVideoStream(clientId) {
+        // Clean up audio context
+        const audioSetup = this.audioContexts.get(clientId);
+        if (audioSetup) {
+            try {
+                audioSetup.source.disconnect();
+                audioSetup.gainNode.disconnect();
+            } catch (e) {
+                console.log('Error disconnecting audio nodes:', e);
+            }
+            this.audioContexts.delete(clientId);
+        }
+
         const wrapper = document.getElementById(`video-wrapper-${clientId}`);
         if (wrapper) {
             wrapper.remove();
@@ -874,6 +992,9 @@ class CallingApp {
             this.frameCryptor.disable();
             this.frameCryptor.clearTransforms();
 
+            // Notify all participants to disable encryption
+            this.broadcastEncryptionDisabled();
+
             this.showToast('🔓 Шифрование выключено');
         }
     }
@@ -891,6 +1012,19 @@ class CallingApp {
                 }));
             }
         });
+    }
+
+    broadcastEncryptionDisabled() {
+        // Notify all participants that encryption is disabled
+        this.participants.forEach((participant, clientId) => {
+            if (clientId !== this.clientId) {
+                this.ws.send(JSON.stringify({
+                    type: 'encryption-disabled',
+                    targetId: clientId
+                }));
+            }
+        });
+        console.log('Broadcast encryption disabled to all participants');
     }
 
     async handleEncryptionKey(message) {
@@ -936,6 +1070,327 @@ class CallingApp {
         }
     }
 
+    handleEncryptionDisabled(message) {
+        try {
+            // Disable encryption
+            this.frameCryptor.disable();
+            this.frameCryptor.clearTransforms();
+            this.isEncryptionEnabled = false;
+
+            // Update UI
+            const btn = document.getElementById('toggle-encryption-btn');
+            const encryptionOn = btn.querySelector('.encryption-on');
+            const encryptionOff = btn.querySelector('.encryption-off');
+            const indicator = document.getElementById('encryption-indicator');
+
+            btn.classList.remove('active');
+            encryptionOn.classList.add('hidden');
+            encryptionOff.classList.remove('hidden');
+            indicator.classList.add('hidden');
+
+            console.log('Encryption disabled by:', message.senderId);
+            this.showToast('🔓 Шифрование выключено');
+        } catch (error) {
+            console.error('Error handling encryption disabled:', error);
+        }
+    }
+
+    // Reactions System
+    loadReactionCounts() {
+        const saved = localStorage.getItem('reactionCounts');
+        if (saved) {
+            try {
+                return JSON.parse(saved);
+            } catch (e) {
+                console.error('Error loading reaction counts:', e);
+            }
+        }
+        // Initialize with zero counts
+        return this.reactions.reduce((acc, emoji) => {
+            acc[emoji] = 0;
+            return acc;
+        }, {});
+    }
+
+    saveReactionCounts() {
+        localStorage.setItem('reactionCounts', JSON.stringify(this.reactionCounts));
+    }
+
+    getSortedReactions() {
+        // Sort reactions by count (descending), then by original order
+        return [...this.reactions].sort((a, b) => {
+            const countDiff = (this.reactionCounts[b] || 0) - (this.reactionCounts[a] || 0);
+            if (countDiff !== 0) return countDiff;
+            // Keep original order if counts are equal
+            return this.reactions.indexOf(a) - this.reactions.indexOf(b);
+        });
+    }
+
+    renderReactions() {
+        const grid = document.getElementById('reactions-grid');
+        grid.innerHTML = '';
+
+        const sortedReactions = this.getSortedReactions();
+
+        sortedReactions.forEach(emoji => {
+            const item = document.createElement('div');
+            item.className = 'reaction-item';
+            item.textContent = emoji;
+
+            // Add count badge if count > 0
+            const count = this.reactionCounts[emoji] || 0;
+            if (count > 0) {
+                const badge = document.createElement('div');
+                badge.className = 'reaction-count';
+                badge.textContent = count;
+                item.appendChild(badge);
+            }
+
+            item.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.sendReaction(emoji);
+            });
+
+            grid.appendChild(item);
+        });
+    }
+
+    toggleReactionsDropdown() {
+        const dropdown = document.getElementById('reactions-dropdown');
+        const isHidden = dropdown.classList.contains('hidden');
+
+        if (isHidden) {
+            // Show dropdown
+            this.renderReactions();
+            dropdown.classList.remove('hidden');
+        } else {
+            // Hide dropdown
+            dropdown.classList.add('hidden');
+        }
+    }
+
+    sendReaction(emoji) {
+        if (!this.roomId) return;
+
+        // Increment local count
+        this.reactionCounts[emoji] = (this.reactionCounts[emoji] || 0) + 1;
+        this.saveReactionCounts();
+
+        // Show flying emoji locally
+        this.showFlyingReaction(emoji);
+
+        // Play sound
+        this.playReactionSound();
+
+        // Send to all participants
+        this.participants.forEach((participant, clientId) => {
+            if (clientId !== this.clientId) {
+                this.ws.send(JSON.stringify({
+                    type: 'reaction',
+                    emoji: emoji,
+                    targetId: clientId
+                }));
+            }
+        });
+
+        console.log('Sent reaction:', emoji);
+    }
+
+    handleReaction(message) {
+        const emoji = message.emoji;
+        console.log('Received reaction:', emoji, 'from:', message.senderId);
+
+        // Show flying emoji
+        this.showFlyingReaction(emoji);
+
+        // Play sound
+        this.playReactionSound();
+    }
+
+    showFlyingReaction(emoji) {
+        const overlay = document.getElementById('reactions-overlay');
+        const reaction = document.createElement('div');
+        reaction.className = 'flying-reaction';
+        reaction.textContent = emoji;
+
+        // Random horizontal position
+        const randomX = Math.random() * (overlay.offsetWidth - 50);
+        reaction.style.left = randomX + 'px';
+
+        // Random drift and rotation for variety
+        const driftX = (Math.random() - 0.5) * 100;
+        const rotate = (Math.random() - 0.5) * 60;
+        reaction.style.setProperty('--drift-x', `${driftX}px`);
+        reaction.style.setProperty('--rotate', `${rotate}deg`);
+
+        overlay.appendChild(reaction);
+
+        // Remove after animation completes
+        setTimeout(() => {
+            reaction.remove();
+        }, 3000);
+    }
+
+    playReactionSound() {
+        // Initialize audio context if needed
+        if (!this.audioContext) {
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        const ctx = this.audioContext;
+        const oscillator = ctx.createOscillator();
+        const gainNode = ctx.createGain();
+
+        oscillator.connect(gainNode);
+        gainNode.connect(ctx.destination);
+
+        // Create a pleasant "pop" sound
+        oscillator.frequency.setValueAtTime(800, ctx.currentTime);
+        oscillator.frequency.exponentialRampToValueAtTime(400, ctx.currentTime + 0.1);
+
+        // Soft volume
+        gainNode.gain.setValueAtTime(0.1, ctx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
+
+        oscillator.start(ctx.currentTime);
+        oscillator.stop(ctx.currentTime + 0.1);
+    }
+
+    // Volume Control System
+    loadVolumeSettings() {
+        const saved = localStorage.getItem('volumeSettings');
+        if (saved) {
+            try {
+                return JSON.parse(saved);
+            } catch (e) {
+                console.error('Error loading volume settings:', e);
+            }
+        }
+        return {};
+    }
+
+    saveVolumeSettings() {
+        localStorage.setItem('volumeSettings', JSON.stringify(this.volumeSettings));
+    }
+
+    setupVolumeControl(clientId, videoElement, stream) {
+        try {
+            // Create audio context if needed
+            if (!this.audioContext) {
+                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            const audioContext = this.audioContext;
+
+            // Mute the video element (we'll route audio through Web Audio API)
+            videoElement.muted = true;
+
+            // Create audio nodes
+            const source = audioContext.createMediaStreamSource(stream);
+            const gainNode = audioContext.createGain();
+
+            // Set initial volume from saved settings
+            const savedVolume = this.volumeSettings[clientId] || 1.0;
+            gainNode.gain.value = savedVolume;
+
+            // Connect audio pipeline
+            source.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+
+            // Store references
+            this.audioContexts.set(clientId, {
+                context: audioContext,
+                source: source,
+                gainNode: gainNode
+            });
+
+            console.log(`Volume control setup for ${clientId}, initial volume: ${savedVolume}`);
+        } catch (error) {
+            console.error('Error setting up volume control:', error);
+            // Fallback: unmute video element
+            videoElement.muted = false;
+        }
+    }
+
+    showVolumeControl(clientId, buttonElement) {
+        const volumeControl = document.getElementById('volume-control');
+        const volumeSlider = document.getElementById('volume-slider');
+        const volumeValue = document.getElementById('volume-value');
+
+        // Get current volume
+        const currentVolume = this.volumeSettings[clientId] || 1.0;
+        const volumePercent = Math.round(currentVolume * 100);
+
+        // Update slider
+        volumeSlider.value = volumePercent;
+        volumeValue.textContent = volumePercent + '%';
+
+        // Position popup near the button, ensuring it stays within screen bounds
+        const rect = buttonElement.getBoundingClientRect();
+        // Popup dimensions accounting for rotated slider with margins
+        const popupWidth = 60; // very narrow popup matching slider width
+        const popupHeight = 310; // 180px slider + margins + icon + value + padding
+
+        let left = rect.left - 5;
+        let top = rect.bottom + 10;
+
+        // Check if popup goes off the right edge
+        if (left + popupWidth > window.innerWidth) {
+            left = window.innerWidth - popupWidth - 10;
+        }
+
+        // Check if popup goes off the left edge
+        if (left < 10) {
+            left = 10;
+        }
+
+        // Check if popup goes off the bottom edge
+        if (top + popupHeight > window.innerHeight) {
+            // Position above the button instead
+            top = rect.top - popupHeight - 10;
+        }
+
+        // Check if popup goes off the top edge
+        if (top < 10) {
+            top = 10;
+        }
+
+        volumeControl.style.left = left + 'px';
+        volumeControl.style.top = top + 'px';
+
+        // Show popup
+        volumeControl.classList.remove('hidden');
+
+        // Store current target
+        this.currentVolumeTarget = clientId;
+    }
+
+    setParticipantVolume(clientId, volume) {
+        // Update volume in audio context
+        const audioSetup = this.audioContexts.get(clientId);
+        if (audioSetup && audioSetup.gainNode) {
+            audioSetup.gainNode.gain.value = volume;
+        }
+
+        // Save to settings
+        this.volumeSettings[clientId] = volume;
+        this.saveVolumeSettings();
+
+        // Update badge
+        const badge = document.getElementById(`volume-badge-${clientId}`);
+        if (badge) {
+            const percent = Math.round(volume * 100);
+            badge.textContent = percent + '%';
+            if (percent !== 100) {
+                badge.classList.add('visible');
+            } else {
+                badge.classList.remove('visible');
+            }
+        }
+
+        console.log(`Set volume for ${clientId}: ${Math.round(volume * 100)}%`);
+    }
+
     endCall() {
         // Stop local stream
         if (this.localStream) {
@@ -948,6 +1403,17 @@ class CallingApp {
             pc.close();
         });
         this.peerConnections.clear();
+
+        // Clean up all audio contexts
+        this.audioContexts.forEach((audioSetup, clientId) => {
+            try {
+                audioSetup.source.disconnect();
+                audioSetup.gainNode.disconnect();
+            } catch (e) {
+                console.log('Error disconnecting audio nodes:', e);
+            }
+        });
+        this.audioContexts.clear();
 
         // Notify server
         if (this.ws && this.roomId) {

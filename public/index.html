@@ -119,6 +119,18 @@
                 <!-- Video streams will be added dynamically -->
             </div>
 
+            <!-- Reactions overlay for flying emojis -->
+            <div id="reactions-overlay" class="reactions-overlay"></div>
+
+            <!-- Volume control popup -->
+            <div id="volume-control" class="volume-control hidden">
+                <div class="volume-slider-container">
+                    <div class="volume-icon">🔊</div>
+                    <input type="range" id="volume-slider" class="volume-slider" min="0" max="200" value="100" step="1">
+                    <div class="volume-value" id="volume-value">100%</div>
+                </div>
+            </div>
+
             <div class="controls">
                 <button id="toggle-audio-btn" class="control-btn active">
                     <svg class="audio-on" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -159,6 +171,22 @@
                         <circle cx="12" cy="16" r="1" fill="currentColor"></circle>
                     </svg>
                 </button>
+
+                <button id="reactions-btn" class="control-btn" title="Реакции">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <path d="M8 14s1.5 2 4 2 4-2 4-2"></path>
+                        <line x1="9" y1="9" x2="9.01" y2="9"></line>
+                        <line x1="15" y1="9" x2="15.01" y2="9"></line>
+                    </svg>
+                </button>
+
+                <!-- Reactions dropdown -->
+                <div id="reactions-dropdown" class="reactions-dropdown hidden">
+                    <div class="reactions-grid" id="reactions-grid">
+                        <!-- Reactions will be added dynamically -->
+                    </div>
+                </div>
 
                 <button id="end-call-btn" class="control-btn end-call">
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
