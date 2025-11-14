@@ -1,9 +1,49 @@
 // WebRTC Configuration
 const config = {
     iceServers: [
+        // STUN servers (only 1-2 needed)
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-    ]
+
+        // Multiple TURN server options for better reliability
+        // Twilio STUN/TURN (fallback)
+        {
+            urls: 'stun:global.stun.twilio.com:3478'
+        },
+
+        // Free TURN server alternative 1
+        {
+            urls: [
+                'turn:numb.viagenie.ca',
+                'turn:numb.viagenie.ca:3478'
+            ],
+            username: 'webrtc@live.com',
+            credential: 'muazkh'
+        },
+
+        // Free TURN server alternative 2
+        {
+            urls: [
+                'turn:turn.anyfirewall.com:443?transport=tcp',
+            ],
+            username: 'webrtc',
+            credential: 'webrtc'
+        },
+
+        // OpenRelay (may be unstable)
+        {
+            urls: [
+                'turn:openrelay.metered.ca:80',
+                'turn:openrelay.metered.ca:443',
+                'turn:openrelay.metered.ca:443?transport=tcp'
+            ],
+            username: 'openrelayproject',
+            credential: 'openrelayproject'
+        }
+    ],
+    iceCandidatePoolSize: 10,
+    iceTransportPolicy: 'all', // Try all connection types
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require'
 };
 
 class CallingApp {
@@ -16,6 +56,7 @@ class CallingApp {
         this.remoteClientId = null;
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
+        this.pendingIceCandidates = []; // Buffer for ICE candidates
 
         this.initUI();
         this.connectWebSocket();
@@ -189,30 +230,69 @@ class CallingApp {
         });
 
         // Handle remote stream
-        this.peerConnection.ontrack = (event) => {
+        this.peerConnection.ontrack = async (event) => {
             console.log('Received remote track');
             this.remoteVideo.srcObject = event.streams[0];
-            this.updateConnectionStatus('Подключено', true);
+
+            // Try to play with error handling for autoplay policy
+            try {
+                await this.remoteVideo.play();
+                this.updateConnectionStatus('Подключено', true);
+            } catch (error) {
+                console.log('Autoplay prevented, waiting for user interaction');
+                // Video will play when user interacts with the page
+            }
         };
 
         // Handle ICE candidates
         this.peerConnection.onicecandidate = (event) => {
             if (event.candidate) {
+                console.log('Sending ICE candidate:', event.candidate.type, event.candidate.candidate);
                 this.ws.send(JSON.stringify({
                     type: 'ice-candidate',
                     candidate: event.candidate,
                     targetId: remoteClientId
                 }));
+            } else {
+                console.log('All ICE candidates sent');
+            }
+        };
+
+        // Handle ICE connection state
+        this.peerConnection.oniceconnectionstatechange = () => {
+            console.log('ICE connection state:', this.peerConnection.iceConnectionState);
+
+            switch (this.peerConnection.iceConnectionState) {
+                case 'connected':
+                case 'completed':
+                    this.updateConnectionStatus('Подключено', true);
+                    break;
+                case 'failed':
+                    console.error('ICE connection failed. Trying ICE restart...');
+                    this.updateConnectionStatus('Переподключение...');
+                    // Try ICE restart
+                    this.restartIce();
+                    break;
+                case 'disconnected':
+                    this.updateConnectionStatus('Соединение потеряно...');
+                    break;
+                case 'checking':
+                    this.updateConnectionStatus('Подключение...');
+                    break;
             }
         };
 
         // Handle connection state
         this.peerConnection.onconnectionstatechange = () => {
             console.log('Connection state:', this.peerConnection.connectionState);
-            if (this.peerConnection.connectionState === 'disconnected' ||
-                this.peerConnection.connectionState === 'failed') {
-                this.handlePeerLeft();
+            if (this.peerConnection.connectionState === 'failed') {
+                this.showToast('Не удалось установить соединение. Попробуйте пересоздать звонок.');
             }
+        };
+
+        // Handle ICE gathering state
+        this.peerConnection.onicegatheringstatechange = () => {
+            console.log('ICE gathering state:', this.peerConnection.iceGatheringState);
         };
 
         return this.peerConnection;
@@ -236,10 +316,37 @@ class CallingApp {
     }
 
     async handleOffer(message) {
+        // Ensure we have local stream before creating peer connection
+        if (!this.localStream) {
+            try {
+                this.localStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 },
+                        facingMode: 'user'
+                    },
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+                this.localVideo.srcObject = this.localStream;
+            } catch (error) {
+                console.error('Error accessing media devices:', error);
+                this.showToast('Не удалось получить доступ к камере/микрофону');
+                return;
+            }
+        }
+
         const pc = this.createPeerConnection(message.senderId);
 
         try {
             await pc.setRemoteDescription(new RTCSessionDescription(message.offer));
+
+            // Process any pending ICE candidates
+            await this.processPendingIceCandidates();
+
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
 
@@ -256,6 +363,9 @@ class CallingApp {
     async handleAnswer(message) {
         try {
             await this.peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+
+            // Process any pending ICE candidates
+            await this.processPendingIceCandidates();
         } catch (error) {
             console.error('Error handling answer:', error);
         }
@@ -264,10 +374,56 @@ class CallingApp {
     async handleIceCandidate(message) {
         try {
             if (this.peerConnection) {
-                await this.peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                const candidate = new RTCIceCandidate(message.candidate);
+
+                // Check if remote description is set
+                if (this.peerConnection.remoteDescription) {
+                    await this.peerConnection.addIceCandidate(candidate);
+                } else {
+                    // Buffer the candidate until remote description is set
+                    this.pendingIceCandidates.push(candidate);
+                    console.log('Buffered ICE candidate, total pending:', this.pendingIceCandidates.length);
+                }
             }
         } catch (error) {
             console.error('Error adding ICE candidate:', error);
+        }
+    }
+
+    async processPendingIceCandidates() {
+        if (this.pendingIceCandidates.length > 0 && this.peerConnection) {
+            console.log('Processing', this.pendingIceCandidates.length, 'pending ICE candidates');
+
+            for (const candidate of this.pendingIceCandidates) {
+                try {
+                    await this.peerConnection.addIceCandidate(candidate);
+                } catch (error) {
+                    console.error('Error adding pending ICE candidate:', error);
+                }
+            }
+
+            this.pendingIceCandidates = [];
+        }
+    }
+
+    async restartIce() {
+        if (!this.peerConnection || !this.remoteClientId) {
+            return;
+        }
+
+        console.log('Attempting ICE restart...');
+
+        try {
+            const offer = await this.peerConnection.createOffer({ iceRestart: true });
+            await this.peerConnection.setLocalDescription(offer);
+
+            this.ws.send(JSON.stringify({
+                type: 'offer',
+                offer: offer,
+                targetId: this.remoteClientId
+            }));
+        } catch (error) {
+            console.error('Error during ICE restart:', error);
         }
     }
 
@@ -282,6 +438,7 @@ class CallingApp {
 
         this.remoteVideo.srcObject = null;
         this.remoteClientId = null;
+        this.pendingIceCandidates = [];
     }
 
     toggleAudio() {
@@ -345,6 +502,7 @@ class CallingApp {
         this.remoteClientId = null;
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
+        this.pendingIceCandidates = [];
 
         // Update UI
         this.localVideo.srcObject = null;
