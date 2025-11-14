@@ -10,6 +10,15 @@ const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
 
+// Health check endpoint for monitoring
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    uptime: process.uptime(),
+    rooms: rooms.size
+  });
+});
+
 // Serve static files from public directory
 app.use(express.static('public'));
 
@@ -137,7 +146,8 @@ wss.on('connection', (ws) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`Calling service running on port ${PORT}`);
-  console.log(`Open http://localhost:${PORT} in your browser`);
+  console.log(`Server ready to accept connections`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
 });
