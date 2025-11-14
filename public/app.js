@@ -319,6 +319,18 @@ class CallingApp {
             if (!volumeControl.contains(e.target) && !clickedVolumeBtn) {
                 volumeControl.classList.add('hidden');
             }
+
+            // Hide video controls when clicking outside video wrappers
+            const videoWrappers = document.querySelectorAll('.video-wrapper');
+            let clickedVideoWrapper = false;
+            videoWrappers.forEach(wrapper => {
+                if (wrapper.contains(e.target)) clickedVideoWrapper = true;
+            });
+            if (!clickedVideoWrapper) {
+                document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
+                    w.classList.remove('show-controls');
+                });
+            }
         });
 
         // Volume slider event listeners
@@ -544,6 +556,22 @@ class CallingApp {
 
         // Add volume control button for remote participants
         if (!isLocal) {
+            // Add click handler to show controls
+            wrapper.addEventListener('click', (e) => {
+                // Toggle controls visibility
+                const wasShowing = wrapper.classList.contains('show-controls');
+
+                // Hide controls on all other videos
+                document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
+                    w.classList.remove('show-controls');
+                });
+
+                // Show controls on this video if it wasn't showing before
+                if (!wasShowing) {
+                    wrapper.classList.add('show-controls');
+                }
+            });
+
             const volumeBtn = document.createElement('div');
             volumeBtn.className = 'volume-btn';
             volumeBtn.innerHTML = '🔊';
@@ -1300,7 +1328,7 @@ class CallingApp {
         // Position popup near the button, ensuring it stays within screen bounds
         const rect = buttonElement.getBoundingClientRect();
         const popupWidth = 92; // approximate width of popup (60px min-width + padding)
-        const popupHeight = 230; // approximate height of popup
+        const popupHeight = 240; // approximate height (150px slider + icon + value + padding + rotation space)
 
         let left = rect.left - 30;
         let top = rect.bottom + 10;
