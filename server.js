@@ -44,6 +44,8 @@ wss.on('connection', (ws) => {
         case 'answer':
         case 'ice-candidate':
         case 'encryption-key':
+        case 'encryption-disabled':
+        case 'reaction':
           handleSignaling(data, currentRoom, clientId);
           break;
 

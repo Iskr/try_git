@@ -250,6 +250,11 @@ class CallingApp {
         this.frameCryptor = new FrameCryptor();
         this.isEncryptionEnabled = false;
 
+        // Reactions system
+        this.reactions = ['❤️', '👍', '😂', '😮', '😢', '🔥', '🎉', '👏', '💯', '🚀'];
+        this.reactionCounts = this.loadReactionCounts();
+        this.audioContext = null;
+
         this.initUI();
         this.connectWebSocket();
     }
@@ -268,6 +273,7 @@ class CallingApp {
         document.getElementById('toggle-audio-btn').addEventListener('click', () => this.toggleAudio());
         document.getElementById('toggle-video-btn').addEventListener('click', () => this.toggleVideo());
         document.getElementById('toggle-encryption-btn').addEventListener('click', () => this.toggleEncryption());
+        document.getElementById('reactions-btn').addEventListener('click', () => this.toggleReactionsDropdown());
         document.getElementById('end-call-btn').addEventListener('click', () => this.endCall());
         document.getElementById('copy-link-btn').addEventListener('click', () => this.copyLink());
         document.getElementById('share-telegram-btn').addEventListener('click', () => this.shareTelegram());
@@ -289,6 +295,13 @@ class CallingApp {
             const layoutBtn = document.getElementById('layout-btn');
             if (!layoutSelector.contains(e.target) && !layoutBtn.contains(e.target)) {
                 layoutSelector.classList.add('hidden');
+            }
+
+            // Close reactions dropdown when clicking outside
+            const reactionsDropdown = document.getElementById('reactions-dropdown');
+            const reactionsBtn = document.getElementById('reactions-btn');
+            if (!reactionsDropdown.contains(e.target) && !reactionsBtn.contains(e.target)) {
+                reactionsDropdown.classList.add('hidden');
             }
         });
 
@@ -387,6 +400,14 @@ class CallingApp {
 
             case 'encryption-key':
                 await this.handleEncryptionKey(message);
+                break;
+
+            case 'encryption-disabled':
+                this.handleEncryptionDisabled(message);
+                break;
+
+            case 'reaction':
+                this.handleReaction(message);
                 break;
 
             case 'peer-left':
@@ -874,6 +895,9 @@ class CallingApp {
             this.frameCryptor.disable();
             this.frameCryptor.clearTransforms();
 
+            // Notify all participants to disable encryption
+            this.broadcastEncryptionDisabled();
+
             this.showToast('🔓 Шифрование выключено');
         }
     }
@@ -891,6 +915,19 @@ class CallingApp {
                 }));
             }
         });
+    }
+
+    broadcastEncryptionDisabled() {
+        // Notify all participants that encryption is disabled
+        this.participants.forEach((participant, clientId) => {
+            if (clientId !== this.clientId) {
+                this.ws.send(JSON.stringify({
+                    type: 'encryption-disabled',
+                    targetId: clientId
+                }));
+            }
+        });
+        console.log('Broadcast encryption disabled to all participants');
     }
 
     async handleEncryptionKey(message) {
@@ -934,6 +971,193 @@ class CallingApp {
             console.error('Error handling encryption key:', error);
             this.showToast('Ошибка получения ключа шифрования');
         }
+    }
+
+    handleEncryptionDisabled(message) {
+        try {
+            // Disable encryption
+            this.frameCryptor.disable();
+            this.frameCryptor.clearTransforms();
+            this.isEncryptionEnabled = false;
+
+            // Update UI
+            const btn = document.getElementById('toggle-encryption-btn');
+            const encryptionOn = btn.querySelector('.encryption-on');
+            const encryptionOff = btn.querySelector('.encryption-off');
+            const indicator = document.getElementById('encryption-indicator');
+
+            btn.classList.remove('active');
+            encryptionOn.classList.add('hidden');
+            encryptionOff.classList.remove('hidden');
+            indicator.classList.add('hidden');
+
+            console.log('Encryption disabled by:', message.senderId);
+            this.showToast('🔓 Шифрование выключено');
+        } catch (error) {
+            console.error('Error handling encryption disabled:', error);
+        }
+    }
+
+    // Reactions System
+    loadReactionCounts() {
+        const saved = localStorage.getItem('reactionCounts');
+        if (saved) {
+            try {
+                return JSON.parse(saved);
+            } catch (e) {
+                console.error('Error loading reaction counts:', e);
+            }
+        }
+        // Initialize with zero counts
+        return this.reactions.reduce((acc, emoji) => {
+            acc[emoji] = 0;
+            return acc;
+        }, {});
+    }
+
+    saveReactionCounts() {
+        localStorage.setItem('reactionCounts', JSON.stringify(this.reactionCounts));
+    }
+
+    getSortedReactions() {
+        // Sort reactions by count (descending), then by original order
+        return [...this.reactions].sort((a, b) => {
+            const countDiff = (this.reactionCounts[b] || 0) - (this.reactionCounts[a] || 0);
+            if (countDiff !== 0) return countDiff;
+            // Keep original order if counts are equal
+            return this.reactions.indexOf(a) - this.reactions.indexOf(b);
+        });
+    }
+
+    renderReactions() {
+        const grid = document.getElementById('reactions-grid');
+        grid.innerHTML = '';
+
+        const sortedReactions = this.getSortedReactions();
+
+        sortedReactions.forEach(emoji => {
+            const item = document.createElement('div');
+            item.className = 'reaction-item';
+            item.textContent = emoji;
+
+            // Add count badge if count > 0
+            const count = this.reactionCounts[emoji] || 0;
+            if (count > 0) {
+                const badge = document.createElement('div');
+                badge.className = 'reaction-count';
+                badge.textContent = count;
+                item.appendChild(badge);
+            }
+
+            item.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.sendReaction(emoji);
+                this.toggleReactionsDropdown();
+            });
+
+            grid.appendChild(item);
+        });
+    }
+
+    toggleReactionsDropdown() {
+        const dropdown = document.getElementById('reactions-dropdown');
+        const isHidden = dropdown.classList.contains('hidden');
+
+        if (isHidden) {
+            // Show dropdown
+            this.renderReactions();
+            dropdown.classList.remove('hidden');
+        } else {
+            // Hide dropdown
+            dropdown.classList.add('hidden');
+        }
+    }
+
+    sendReaction(emoji) {
+        if (!this.roomId) return;
+
+        // Increment local count
+        this.reactionCounts[emoji] = (this.reactionCounts[emoji] || 0) + 1;
+        this.saveReactionCounts();
+
+        // Show flying emoji locally
+        this.showFlyingReaction(emoji);
+
+        // Play sound
+        this.playReactionSound();
+
+        // Send to all participants
+        this.participants.forEach((participant, clientId) => {
+            if (clientId !== this.clientId) {
+                this.ws.send(JSON.stringify({
+                    type: 'reaction',
+                    emoji: emoji,
+                    targetId: clientId
+                }));
+            }
+        });
+
+        console.log('Sent reaction:', emoji);
+    }
+
+    handleReaction(message) {
+        const emoji = message.emoji;
+        console.log('Received reaction:', emoji, 'from:', message.senderId);
+
+        // Show flying emoji
+        this.showFlyingReaction(emoji);
+
+        // Play sound
+        this.playReactionSound();
+    }
+
+    showFlyingReaction(emoji) {
+        const overlay = document.getElementById('reactions-overlay');
+        const reaction = document.createElement('div');
+        reaction.className = 'flying-reaction';
+        reaction.textContent = emoji;
+
+        // Random horizontal position
+        const randomX = Math.random() * (overlay.offsetWidth - 50);
+        reaction.style.left = randomX + 'px';
+
+        // Random drift and rotation for variety
+        const driftX = (Math.random() - 0.5) * 100;
+        const rotate = (Math.random() - 0.5) * 60;
+        reaction.style.setProperty('--drift-x', `${driftX}px`);
+        reaction.style.setProperty('--rotate', `${rotate}deg`);
+
+        overlay.appendChild(reaction);
+
+        // Remove after animation completes
+        setTimeout(() => {
+            reaction.remove();
+        }, 3000);
+    }
+
+    playReactionSound() {
+        // Initialize audio context if needed
+        if (!this.audioContext) {
+            this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        const ctx = this.audioContext;
+        const oscillator = ctx.createOscillator();
+        const gainNode = ctx.createGain();
+
+        oscillator.connect(gainNode);
+        gainNode.connect(ctx.destination);
+
+        // Create a pleasant "pop" sound
+        oscillator.frequency.setValueAtTime(800, ctx.currentTime);
+        oscillator.frequency.exponentialRampToValueAtTime(400, ctx.currentTime + 0.1);
+
+        // Soft volume
+        gainNode.gain.setValueAtTime(0.1, ctx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
+
+        oscillator.start(ctx.currentTime);
+        oscillator.stop(ctx.currentTime + 0.1);
     }
 
     endCall() {
