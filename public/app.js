@@ -1,35 +1,13 @@
 // WebRTC Configuration
 const config = {
     iceServers: [
-        // STUN servers (only 1-2 needed)
+        // Primary STUN server
         { urls: 'stun:stun.l.google.com:19302' },
 
-        // Multiple TURN server options for better reliability
-        // Twilio STUN/TURN (fallback)
-        {
-            urls: 'stun:global.stun.twilio.com:3478'
-        },
+        // Backup STUN server
+        { urls: 'stun:stun1.l.google.com:19302' },
 
-        // Free TURN server alternative 1
-        {
-            urls: [
-                'turn:numb.viagenie.ca',
-                'turn:numb.viagenie.ca:3478'
-            ],
-            username: 'webrtc@live.com',
-            credential: 'muazkh'
-        },
-
-        // Free TURN server alternative 2
-        {
-            urls: [
-                'turn:turn.anyfirewall.com:443?transport=tcp',
-            ],
-            username: 'webrtc',
-            credential: 'webrtc'
-        },
-
-        // OpenRelay (may be unstable)
+        // Primary TURN server - OpenRelay (most reliable free option)
         {
             urls: [
                 'turn:openrelay.metered.ca:80',
@@ -38,6 +16,13 @@ const config = {
             ],
             username: 'openrelayproject',
             credential: 'openrelayproject'
+        },
+
+        // Backup TURN server
+        {
+            urls: 'turn:numb.viagenie.ca',
+            username: 'webrtc@live.com',
+            credential: 'muazkh'
         }
     ],
     iceCandidatePoolSize: 10,
@@ -259,6 +244,11 @@ class CallingApp {
         this.audioContexts = new Map(); // Map<clientId, {context, gainNode, source}>
         this.volumeSettings = this.loadVolumeSettings();
         this.currentVolumeTarget = null;
+
+        // ICE restart tracking
+        this.iceRestartAttempts = new Map(); // Map<clientId, attemptCount>
+        this.iceRestartTimers = new Map(); // Map<clientId, timerId>
+        this.MAX_ICE_RESTART_ATTEMPTS = 5;
 
         this.initUI();
         this.connectWebSocket();
@@ -704,14 +694,22 @@ class CallingApp {
         // Handle ICE candidates
         pc.onicecandidate = (event) => {
             if (event.candidate) {
-                console.log('Sending ICE candidate to:', remoteClientId, event.candidate.type);
+                const candidate = event.candidate;
+                console.log(`→ ICE candidate for ${remoteClientId}:`, {
+                    type: candidate.type,
+                    protocol: candidate.protocol,
+                    address: candidate.address,
+                    port: candidate.port,
+                    priority: candidate.priority,
+                    foundation: candidate.foundation
+                });
                 this.ws.send(JSON.stringify({
                     type: 'ice-candidate',
-                    candidate: event.candidate,
+                    candidate: candidate,
                     targetId: remoteClientId
                 }));
             } else {
-                console.log('All ICE candidates sent to:', remoteClientId);
+                console.log(`✓ All ICE candidates sent to: ${remoteClientId}`);
             }
         };
 
@@ -722,14 +720,35 @@ class CallingApp {
             switch (pc.iceConnectionState) {
                 case 'connected':
                 case 'completed':
+                    // Reset restart attempts on successful connection
+                    this.iceRestartAttempts.set(remoteClientId, 0);
+                    if (this.iceRestartTimers.has(remoteClientId)) {
+                        clearTimeout(this.iceRestartTimers.get(remoteClientId));
+                        this.iceRestartTimers.delete(remoteClientId);
+                    }
                     this.updateConnectionStatus(`${this.participants.size} участников`, true);
+                    console.log(`✓ ICE connection established with ${remoteClientId}`);
                     break;
                 case 'failed':
-                    console.error('ICE connection failed for:', remoteClientId);
-                    this.restartIce(remoteClientId);
+                    console.error(`✗ ICE connection failed for: ${remoteClientId}`);
+                    this.handleIceConnectionFailed(remoteClientId);
                     break;
                 case 'disconnected':
+                    console.warn(`⚠ ICE connection disconnected for: ${remoteClientId}`);
                     this.updateConnectionStatus('Переподключение...');
+                    // Give it some time before attempting restart
+                    if (!this.iceRestartTimers.has(remoteClientId)) {
+                        const timer = setTimeout(() => {
+                            if (pc.iceConnectionState === 'disconnected') {
+                                console.log(`Attempting recovery from disconnected state for ${remoteClientId}`);
+                                this.handleIceConnectionFailed(remoteClientId);
+                            }
+                        }, 5000); // Wait 5 seconds
+                        this.iceRestartTimers.set(remoteClientId, timer);
+                    }
+                    break;
+                case 'checking':
+                    console.log(`→ ICE checking connection with ${remoteClientId}...`);
                     break;
             }
         };
@@ -830,20 +849,28 @@ class CallingApp {
             if (pc) {
                 const candidate = new RTCIceCandidate(message.candidate);
 
+                console.log(`← Received ICE candidate from ${message.senderId}:`, {
+                    type: candidate.type,
+                    protocol: candidate.protocol,
+                    address: candidate.address,
+                    port: candidate.port
+                });
+
                 // Check if remote description is set
                 if (pc.remoteDescription) {
                     await pc.addIceCandidate(candidate);
+                    console.log(`✓ Added ICE candidate for ${message.senderId}`);
                 } else {
                     // Buffer the candidate until remote description is set
                     if (!this.pendingIceCandidates.has(message.senderId)) {
                         this.pendingIceCandidates.set(message.senderId, []);
                     }
                     this.pendingIceCandidates.get(message.senderId).push(candidate);
-                    console.log(`Buffered ICE candidate for ${message.senderId}`);
+                    console.log(`📦 Buffered ICE candidate for ${message.senderId} (waiting for remote description)`);
                 }
             }
         } catch (error) {
-            console.error('Error adding ICE candidate:', error);
+            console.error('❌ Error adding ICE candidate:', error);
         }
     }
 
@@ -867,11 +894,54 @@ class CallingApp {
         }
     }
 
+    async handleIceConnectionFailed(clientId) {
+        const pc = this.peerConnections.get(clientId);
+        if (!pc) return;
+
+        // Get current attempt count
+        const attempts = this.iceRestartAttempts.get(clientId) || 0;
+
+        if (attempts >= this.MAX_ICE_RESTART_ATTEMPTS) {
+            console.error(`❌ Max ICE restart attempts (${this.MAX_ICE_RESTART_ATTEMPTS}) reached for ${clientId}`);
+            this.showToast('⚠️ Не удалось подключиться к участнику. Проверьте интернет-соединение');
+
+            // Show persistent error indicator
+            this.updateConnectionStatus('Ошибка подключения');
+            return;
+        }
+
+        // Increment attempt counter
+        this.iceRestartAttempts.set(clientId, attempts + 1);
+
+        // Calculate exponential backoff delay: 0s, 2s, 4s, 8s, 16s
+        const delay = attempts === 0 ? 0 : Math.pow(2, attempts - 1) * 2000;
+
+        console.log(`🔄 Scheduling ICE restart for ${clientId} (attempt ${attempts + 1}/${this.MAX_ICE_RESTART_ATTEMPTS}) in ${delay}ms`);
+
+        if (delay > 0) {
+            this.showToast(`Переподключение (попытка ${attempts + 1}/${this.MAX_ICE_RESTART_ATTEMPTS})...`);
+        }
+
+        // Clear any existing timer
+        if (this.iceRestartTimers.has(clientId)) {
+            clearTimeout(this.iceRestartTimers.get(clientId));
+        }
+
+        // Schedule ICE restart with delay
+        const timer = setTimeout(async () => {
+            await this.restartIce(clientId);
+            this.iceRestartTimers.delete(clientId);
+        }, delay);
+
+        this.iceRestartTimers.set(clientId, timer);
+    }
+
     async restartIce(clientId) {
         const pc = this.peerConnections.get(clientId);
         if (!pc) return;
 
-        console.log(`Attempting ICE restart for ${clientId}...`);
+        const attempts = this.iceRestartAttempts.get(clientId) || 0;
+        console.log(`🔄 Performing ICE restart for ${clientId} (attempt ${attempts}/${this.MAX_ICE_RESTART_ATTEMPTS})...`);
 
         try {
             const offer = await pc.createOffer({ iceRestart: true });
@@ -882,8 +952,15 @@ class CallingApp {
                 offer: offer,
                 targetId: clientId
             }));
+
+            console.log(`→ ICE restart offer sent to ${clientId}`);
         } catch (error) {
-            console.error('Error during ICE restart:', error);
+            console.error('❌ Error during ICE restart:', error);
+
+            // Try again after a short delay
+            setTimeout(() => {
+                this.handleIceConnectionFailed(clientId);
+            }, 1000);
         }
     }
 
@@ -905,6 +982,13 @@ class CallingApp {
 
         // Clean up pending candidates
         this.pendingIceCandidates.delete(clientId);
+
+        // Clean up ICE restart tracking
+        this.iceRestartAttempts.delete(clientId);
+        if (this.iceRestartTimers.has(clientId)) {
+            clearTimeout(this.iceRestartTimers.get(clientId));
+            this.iceRestartTimers.delete(clientId);
+        }
 
         this.showToast('Участник покинул звонок');
         this.updateConnectionStatus(`${this.participants.size} участников`);
@@ -1427,6 +1511,13 @@ class CallingApp {
         this.isEncryptionEnabled = false;
         this.frameCryptor.disable();
         this.frameCryptor.clearTransforms();
+
+        // Clean up ICE restart timers
+        this.iceRestartTimers.forEach((timer, clientId) => {
+            clearTimeout(timer);
+        });
+        this.iceRestartTimers.clear();
+        this.iceRestartAttempts.clear();
 
         // Reset state
         this.roomId = null;
