@@ -7,18 +7,108 @@
     <meta name="mobile-web-app-capable" content="yes">
     <title>Звонки</title>
     <link rel="stylesheet" href="style.css">
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
 </head>
 <body>
+    <!-- Balance indicator (shown on all screens) -->
+    <div id="balance-indicator" class="balance-indicator">
+        <div class="balance-content" id="balance-btn">
+            <span class="balance-icon">💎</span>
+            <span class="balance-value" id="balance-value">100</span>
+        </div>
+        <button class="balance-add-btn" id="add-balance-btn" title="Пополнить баланс">+</button>
+    </div>
+
     <div class="container">
+        <!-- Auth Screen -->
+        <div id="auth-screen" class="screen active">
+            <div class="logo">
+                <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+                </svg>
+            </div>
+            <h1>Добро пожаловать</h1>
+            <p class="subtitle">Войдите или зарегистрируйтесь для продолжения</p>
+
+            <div class="auth-container">
+                <div class="auth-tabs">
+                    <button id="login-tab" class="auth-tab active">Вход</button>
+                    <button id="register-tab" class="auth-tab">Регистрация</button>
+                </div>
+
+                <!-- Login Form -->
+                <div id="login-form" class="auth-form">
+                    <div class="input-group">
+                        <label for="login-email">Email</label>
+                        <input type="email" id="login-email" placeholder="your@email.com" autocomplete="email">
+                    </div>
+                    <div class="input-group">
+                        <label for="login-password">Пароль</label>
+                        <input type="password" id="login-password" placeholder="Введите пароль" autocomplete="current-password">
+                    </div>
+                    <button id="login-btn" class="btn btn-primary">Войти</button>
+                    <div class="auth-divider">
+                        <span>или</span>
+                    </div>
+                    <button id="google-login-btn" class="btn btn-google">
+                        <svg width="18" height="18" viewBox="0 0 24 24">
+                            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                        </svg>
+                        Войти через Google
+                    </button>
+                </div>
+
+                <!-- Register Form -->
+                <div id="register-form" class="auth-form hidden">
+                    <div class="input-group">
+                        <label for="register-name">Имя</label>
+                        <input type="text" id="register-name" placeholder="Ваше имя" autocomplete="name">
+                    </div>
+                    <div class="input-group">
+                        <label for="register-email">Email</label>
+                        <input type="email" id="register-email" placeholder="your@email.com" autocomplete="email">
+                    </div>
+                    <div class="input-group">
+                        <label for="register-password">Пароль</label>
+                        <input type="password" id="register-password" placeholder="Минимум 6 символов" autocomplete="new-password">
+                    </div>
+                    <div class="input-group">
+                        <label for="register-password-confirm">Подтвердите пароль</label>
+                        <input type="password" id="register-password-confirm" placeholder="Повторите пароль" autocomplete="new-password">
+                    </div>
+                    <button id="register-btn" class="btn btn-primary">Зарегистрироваться</button>
+                    <div class="auth-divider">
+                        <span>или</span>
+                    </div>
+                    <button id="google-register-btn" class="btn btn-google">
+                        <svg width="18" height="18" viewBox="0 0 24 24">
+                            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                            <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                        </svg>
+                        Регистрация через Google
+                    </button>
+                </div>
+            </div>
+        </div>
+
         <!-- Home Screen -->
-        <div id="home-screen" class="screen active">
+        <div id="home-screen" class="screen">
             <div class="logo">
                 <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
                 </svg>
             </div>
             <h1>Звонки</h1>
-            <p class="subtitle">Быстрые и простые звонки</p>
+            <p class="subtitle" id="user-greeting">Быстрые и простые звонки</p>
+            <button id="logout-btn" class="btn btn-secondary btn-small" style="margin-top: 10px;">Выйти</button>
 
             <div class="button-group">
                 <button id="create-call-btn" class="btn btn-primary">
@@ -68,6 +158,14 @@
                 </div>
                 <div class="status-bar">
                     <div class="connection-status" id="connection-status">Подключение...</div>
+                    <div class="call-timer" id="call-timer">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"></circle>
+                            <polyline points="12 6 12 12 16 14"></polyline>
+                        </svg>
+                        <span id="timer-text">00:00</span>
+                        <span id="timer-status" class="timer-free">Бесплатно</span>
+                    </div>
                     <div class="encryption-indicator hidden" id="encryption-indicator">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
@@ -159,7 +257,7 @@
                     </svg>
                 </button>
 
-                <button id="toggle-encryption-btn" class="control-btn" title="Включить шифрование">
+                <button id="toggle-encryption-btn" class="control-btn" title="Включить шифрование (10💎)">
                     <svg class="encryption-off" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
                         <path d="M7 11V7a5 5 0 0 1 9.9-1"></path>
@@ -170,6 +268,7 @@
                         <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
                         <circle cx="12" cy="16" r="1" fill="currentColor"></circle>
                     </svg>
+                    <span class="control-badge">💎10</span>
                 </button>
 
                 <button id="reactions-btn" class="control-btn" title="Реакции">
@@ -188,6 +287,17 @@
                     </div>
                 </div>
 
+                <button id="transcription-btn" class="control-btn" title="Транскрипция звонка (10💎)">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                        <polyline points="10 9 9 9 8 9"></polyline>
+                    </svg>
+                    <span class="control-badge">💎10</span>
+                </button>
+
                 <button id="end-call-btn" class="control-btn end-call">
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
@@ -198,8 +308,54 @@
 
         <!-- Toast notifications -->
         <div id="toast" class="toast"></div>
+
+        <!-- Buy Crystals Modal -->
+        <div id="buy-crystals-modal" class="modal hidden">
+            <div class="modal-overlay"></div>
+            <div class="modal-content">
+                <button class="modal-close" id="close-buy-modal">×</button>
+                <h2>Пополнить баланс</h2>
+                <p class="modal-subtitle">Выберите пакет кристаллов 💎</p>
+
+                <div class="packages-grid" id="packages-grid">
+                    <!-- Packages will be added dynamically -->
+                </div>
+
+                <div class="balance-info">
+                    <div class="info-item">
+                        <span>Текущий баланс:</span>
+                        <strong><span id="modal-balance">100</span> 💎</strong>
+                    </div>
+                    <div class="info-item">
+                        <span>Бесплатное время:</span>
+                        <strong>30 минут</strong>
+                    </div>
+                </div>
+
+                <div class="pricing-info">
+                    <h3>Тарифы</h3>
+                    <div class="pricing-list">
+                        <div class="pricing-item">
+                            <span>Звонок после бесплатного времени</span>
+                            <strong>1💎/мин</strong>
+                        </div>
+                        <div class="pricing-item">
+                            <span>E2E Шифрование</span>
+                            <strong>10💎 за звонок</strong>
+                        </div>
+                        <div class="pricing-item">
+                            <span>Транскрипция в текст</span>
+                            <strong>10💎 за звонок</strong>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
+    <script src="pricing-config.js"></script>
+    <script src="balance-manager.js"></script>
+    <script src="firebase-config.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

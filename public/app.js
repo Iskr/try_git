@@ -260,6 +260,9 @@ class CallingApp {
         this.volumeSettings = this.loadVolumeSettings();
         this.currentVolumeTarget = null;
 
+        // Balance & Monetization system
+        this.balanceManager = new BalanceManager(PRICING_CONFIG);
+
         this.initUI();
         this.connectWebSocket();
     }
@@ -279,6 +282,7 @@ class CallingApp {
         document.getElementById('toggle-video-btn').addEventListener('click', () => this.toggleVideo());
         document.getElementById('toggle-encryption-btn').addEventListener('click', () => this.toggleEncryption());
         document.getElementById('reactions-btn').addEventListener('click', () => this.toggleReactionsDropdown());
+        document.getElementById('transcription-btn').addEventListener('click', () => this.toggleTranscription());
         document.getElementById('end-call-btn').addEventListener('click', () => this.endCall());
         document.getElementById('copy-link-btn').addEventListener('click', () => this.copyLink());
         document.getElementById('share-telegram-btn').addEventListener('click', () => this.shareTelegram());
@@ -521,6 +525,9 @@ class CallingApp {
             // Update URL
             const newUrl = `${window.location.origin}?room=${this.roomId}`;
             window.history.pushState({}, '', newUrl);
+
+            // Start call timer for monetization
+            this.balanceManager.startCallTimer();
 
         } catch (error) {
             console.error('Error accessing media devices:', error);
@@ -951,19 +958,25 @@ class CallingApp {
     }
 
     async toggleEncryption() {
-        this.isEncryptionEnabled = !this.isEncryptionEnabled;
-
         const btn = document.getElementById('toggle-encryption-btn');
         const encryptionOn = btn.querySelector('.encryption-on');
         const encryptionOff = btn.querySelector('.encryption-off');
         const indicator = document.getElementById('encryption-indicator');
 
-        btn.classList.toggle('active', this.isEncryptionEnabled);
-        encryptionOn.classList.toggle('hidden', !this.isEncryptionEnabled);
-        encryptionOff.classList.toggle('hidden', this.isEncryptionEnabled);
-        indicator.classList.toggle('hidden', !this.isEncryptionEnabled);
+        if (!this.isEncryptionEnabled) {
+            // Trying to enable encryption - check balance and pay
+            if (!this.balanceManager.activateEncryption()) {
+                // Not enough balance
+                return;
+            }
 
-        if (this.isEncryptionEnabled) {
+            this.isEncryptionEnabled = true;
+
+            btn.classList.add('active');
+            encryptionOn.classList.remove('hidden');
+            encryptionOff.classList.add('hidden');
+            indicator.classList.remove('hidden');
+
             // Enable encryption
             this.frameCryptor.enable();
 
@@ -985,10 +998,15 @@ class CallingApp {
                     this.frameCryptor.setupReceiverTransform(receiver);
                 });
             });
-
-            this.showToast('🔒 Шифрование включено');
         } else {
             // Disable encryption
+            this.isEncryptionEnabled = false;
+
+            btn.classList.remove('active');
+            encryptionOn.classList.add('hidden');
+            encryptionOff.classList.remove('hidden');
+            indicator.classList.add('hidden');
+
             this.frameCryptor.disable();
             this.frameCryptor.clearTransforms();
 
@@ -996,6 +1014,16 @@ class CallingApp {
             this.broadcastEncryptionDisabled();
 
             this.showToast('🔓 Шифрование выключено');
+        }
+    }
+
+    toggleTranscription() {
+        // Activate transcription with payment
+        if (this.balanceManager.activateTranscription()) {
+            // In a real app, this would start speech-to-text transcription
+            // For now, just show a demo message
+            this.showToast('📝 Транскрипция будет доступна в следующей версии');
+            console.log('Transcription activated - would start real transcription service here');
         }
     }
 
@@ -1427,6 +1455,9 @@ class CallingApp {
         this.isEncryptionEnabled = false;
         this.frameCryptor.disable();
         this.frameCryptor.clearTransforms();
+
+        // Stop call timer
+        this.balanceManager.stopCallTimer();
 
         // Reset state
         this.roomId = null;
