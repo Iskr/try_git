@@ -1,0 +1,31 @@
+{
+  "currency": {
+    "name": "gems",
+    "symbol": "💎",
+    "initialBalance": 100
+  },
+  "pricing": {
+    "freeMinutes": 30,
+    "pricePerMinute": 1,
+    "encryption": {
+      "enabled": true,
+      "costPerCall": 10
+    },
+    "transcription": {
+      "enabled": true,
+      "costPerCall": 10
+    }
+  },
+  "features": {
+    "encryption": {
+      "name": "Шифрование E2EE",
+      "description": "Защищенное сквозное шифрование разговора",
+      "cost": 10
+    },
+    "transcription": {
+      "name": "Расшифровка речи",
+      "description": "Преобразование речи в текст",
+      "cost": 10
+    }
+  }
+}

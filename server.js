@@ -28,8 +28,27 @@ const rooms = new Map();
 wss.on('connection', (ws) => {
   let currentRoom = null;
   let clientId = uuidv4();
+  let heartbeatInterval = null;
+  let isAlive = true;
 
   console.log(`Client connected: ${clientId}`);
+
+  // Setup heartbeat/ping-pong for connection health monitoring
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  // Start heartbeat interval
+  heartbeatInterval = setInterval(() => {
+    if (ws.isAlive === false) {
+      console.log(`Client ${clientId} failed heartbeat check`);
+      clearInterval(heartbeatInterval);
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }, 30000); // Check every 30 seconds
 
   ws.on('message', (message) => {
     try {
@@ -52,6 +71,11 @@ wss.on('connection', (ws) => {
         case 'leave':
           handleLeave(currentRoom, clientId);
           break;
+
+        case 'ping':
+          // Respond to client ping with pong
+          ws.send(JSON.stringify({ type: 'pong', timestamp: data.timestamp }));
+          break;
       }
     } catch (error) {
       console.error('Error processing message:', error);
@@ -60,6 +84,9 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     console.log(`Client disconnected: ${clientId}`);
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+    }
     if (currentRoom) {
       handleLeave(currentRoom, clientId);
     }

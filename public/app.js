@@ -260,7 +260,25 @@ class CallingApp {
         this.volumeSettings = this.loadVolumeSettings();
         this.currentVolumeTarget = null;
 
+        // Connection recovery system
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
+        this.reconnectDelay = 2000; // Start with 2 seconds
+        this.connectionHealthInterval = null;
+        this.lastPongTime = Date.now();
+        this.connectionTimeout = 15000; // 15 seconds without response = bad connection
+
+        // Currency system
+        this.currencyConfig = null;
+        this.userBalance = this.loadBalance();
+        this.callStartTime = null;
+        this.callTimer = null;
+        this.freeTimeRemaining = null;
+        this.encryptionCostPaid = false;
+        this.transcriptionEnabled = false;
+
         this.initUI();
+        this.loadCurrencyConfig();
         this.connectWebSocket();
     }
 
@@ -366,6 +384,9 @@ class CallingApp {
 
         this.ws.onopen = () => {
             console.log('WebSocket connected');
+            this.reconnectAttempts = 0;
+            this.reconnectDelay = 2000;
+            this.startConnectionHealthMonitoring();
         };
 
         this.ws.onmessage = (event) => {
@@ -380,16 +401,87 @@ class CallingApp {
 
         this.ws.onclose = () => {
             console.log('WebSocket disconnected');
+            this.stopConnectionHealthMonitoring();
+
             if (this.roomId) {
-                this.showToast('Соединение потеряно');
+                this.showToast('Соединение потеряно. Попытка переподключения...');
+                this.attemptReconnect();
             }
         };
+    }
+
+    startConnectionHealthMonitoring() {
+        // Clear any existing interval
+        if (this.connectionHealthInterval) {
+            clearInterval(this.connectionHealthInterval);
+        }
+
+        // Send ping every 10 seconds and check for timeout
+        this.connectionHealthInterval = setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                // Check if we've received a pong recently
+                const timeSinceLastPong = Date.now() - this.lastPongTime;
+                if (timeSinceLastPong > this.connectionTimeout) {
+                    console.warn('Connection timeout detected, attempting recovery...');
+                    this.showToast('Плохая связь, восстановление...');
+                    this.ws.close();
+                    return;
+                }
+
+                // Send ping
+                this.ws.send(JSON.stringify({
+                    type: 'ping',
+                    timestamp: Date.now()
+                }));
+            }
+        }, 10000);
+    }
+
+    stopConnectionHealthMonitoring() {
+        if (this.connectionHealthInterval) {
+            clearInterval(this.connectionHealthInterval);
+            this.connectionHealthInterval = null;
+        }
+    }
+
+    attemptReconnect() {
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+            this.showToast('Не удалось восстановить соединение');
+            this.endCall();
+            return;
+        }
+
+        this.reconnectAttempts++;
+        const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
+
+        console.log(`Reconnect attempt ${this.reconnectAttempts} in ${delay}ms`);
+
+        setTimeout(() => {
+            if (this.roomId) {
+                console.log('Attempting to reconnect...');
+                this.connectWebSocket();
+
+                // Wait for connection to open, then rejoin room
+                const checkConnection = setInterval(() => {
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        clearInterval(checkConnection);
+                        this.joinRoom(this.roomId);
+                        this.showToast('Соединение восстановлено');
+                    }
+                }, 100);
+            }
+        }, delay);
     }
 
     async handleSignalingMessage(message) {
         console.log('Received message:', message.type);
 
         switch (message.type) {
+            case 'pong':
+                // Update last pong time for connection health monitoring
+                this.lastPongTime = Date.now();
+                break;
+
             case 'joined':
                 this.clientId = message.clientId;
                 this.roomId = message.roomId;
@@ -521,6 +613,11 @@ class CallingApp {
             // Update URL
             const newUrl = `${window.location.origin}?room=${this.roomId}`;
             window.history.pushState({}, '', newUrl);
+
+            // Start call timer for currency tracking
+            if (this.currencyConfig) {
+                this.startCallTimer();
+            }
 
         } catch (error) {
             console.error('Error accessing media devices:', error);
@@ -951,7 +1048,18 @@ class CallingApp {
     }
 
     async toggleEncryption() {
-        this.isEncryptionEnabled = !this.isEncryptionEnabled;
+        const willEnable = !this.isEncryptionEnabled;
+
+        // Check if user has enough balance for encryption
+        if (willEnable && this.currencyConfig && !this.encryptionCostPaid) {
+            const cost = this.currencyConfig.pricing.encryption.costPerCall;
+            if (!this.deductBalance(cost, 'шифрование')) {
+                return; // Not enough balance
+            }
+            this.encryptionCostPaid = true;
+        }
+
+        this.isEncryptionEnabled = willEnable;
 
         const btn = document.getElementById('toggle-encryption-btn');
         const encryptionOn = btn.querySelector('.encryption-on');
@@ -1392,6 +1500,12 @@ class CallingApp {
     }
 
     endCall() {
+        // Stop call timer
+        this.stopCallTimer();
+
+        // Stop connection health monitoring
+        this.stopConnectionHealthMonitoring();
+
         // Stop local stream
         if (this.localStream) {
             this.localStream.getTracks().forEach(track => track.stop());
@@ -1428,6 +1542,13 @@ class CallingApp {
         this.frameCryptor.disable();
         this.frameCryptor.clearTransforms();
 
+        // Reset currency state
+        this.encryptionCostPaid = false;
+        this.transcriptionEnabled = false;
+
+        // Reset connection recovery state
+        this.reconnectAttempts = 0;
+
         // Reset state
         this.roomId = null;
         this.clientId = null;
@@ -1439,6 +1560,12 @@ class CallingApp {
         // Clear videos
         this.videosContainer.innerHTML = '';
         this.updateGridLayout();
+
+        // Remove call duration display
+        const durationElement = document.getElementById('call-duration');
+        if (durationElement) {
+            durationElement.remove();
+        }
 
         // Update UI
         this.callScreen.classList.remove('active');
@@ -1520,6 +1647,142 @@ class CallingApp {
             result += chars.charAt(Math.floor(Math.random() * chars.length));
         }
         return result;
+    }
+
+    // Currency System Methods
+    async loadCurrencyConfig() {
+        try {
+            const response = await fetch('/currency-config.json');
+            this.currencyConfig = await response.json();
+            console.log('Currency config loaded:', this.currencyConfig);
+            this.updateBalanceDisplay();
+        } catch (error) {
+            console.error('Error loading currency config:', error);
+            // Default config if file not found
+            this.currencyConfig = {
+                currency: { name: 'gems', symbol: '💎', initialBalance: 100 },
+                pricing: {
+                    freeMinutes: 30,
+                    pricePerMinute: 1,
+                    encryption: { enabled: true, costPerCall: 10 },
+                    transcription: { enabled: true, costPerCall: 10 }
+                }
+            };
+        }
+    }
+
+    loadBalance() {
+        const saved = localStorage.getItem('userBalance');
+        if (saved !== null) {
+            return parseInt(saved, 10);
+        }
+        return 100; // Default initial balance
+    }
+
+    saveBalance() {
+        localStorage.setItem('userBalance', this.userBalance.toString());
+        this.updateBalanceDisplay();
+    }
+
+    deductBalance(amount, reason) {
+        if (this.userBalance >= amount) {
+            this.userBalance -= amount;
+            this.saveBalance();
+            console.log(`Deducted ${amount} gems for ${reason}. New balance: ${this.userBalance}`);
+            this.showToast(`-${amount}💎 ${reason}`);
+            return true;
+        } else {
+            this.showToast(`Недостаточно 💎. Нужно: ${amount}, есть: ${this.userBalance}`);
+            return false;
+        }
+    }
+
+    updateBalanceDisplay() {
+        // Update balance display in UI
+        let balanceElement = document.getElementById('balance-display');
+        if (!balanceElement && this.currencyConfig) {
+            // Create balance display if it doesn't exist
+            balanceElement = document.createElement('div');
+            balanceElement.id = 'balance-display';
+            balanceElement.className = 'balance-display';
+
+            const homeScreen = document.getElementById('home-screen');
+            if (homeScreen) {
+                const logo = homeScreen.querySelector('.logo');
+                if (logo) {
+                    logo.parentNode.insertBefore(balanceElement, logo.nextSibling);
+                }
+            }
+        }
+
+        if (balanceElement && this.currencyConfig) {
+            balanceElement.innerHTML = `<span class="balance-amount">${this.userBalance} ${this.currencyConfig.currency.symbol}</span>`;
+        }
+    }
+
+    startCallTimer() {
+        this.callStartTime = Date.now();
+        this.freeTimeRemaining = this.currencyConfig.pricing.freeMinutes * 60; // Convert to seconds
+        this.encryptionCostPaid = false;
+
+        // Update timer every second
+        this.callTimer = setInterval(() => {
+            const elapsed = Math.floor((Date.now() - this.callStartTime) / 1000);
+            const minutes = Math.floor(elapsed / 60);
+            const seconds = elapsed % 60;
+
+            // Update call duration display
+            this.updateCallDuration(minutes, seconds);
+
+            // Check if free time has expired
+            if (elapsed > this.freeTimeRemaining) {
+                // Deduct per minute after free time
+                const paidMinutes = Math.floor((elapsed - this.freeTimeRemaining) / 60);
+                const currentMinute = Math.floor(elapsed / 60);
+
+                // Deduct at the start of each paid minute
+                if (elapsed % 60 === 0 && paidMinutes > 0) {
+                    const cost = this.currencyConfig.pricing.pricePerMinute;
+                    if (!this.deductBalance(cost, 'минута разговора')) {
+                        this.showToast('Недостаточно 💎, звонок завершается');
+                        this.endCall();
+                    }
+                }
+            }
+        }, 1000);
+    }
+
+    stopCallTimer() {
+        if (this.callTimer) {
+            clearInterval(this.callTimer);
+            this.callTimer = null;
+        }
+    }
+
+    updateCallDuration(minutes, seconds) {
+        let durationElement = document.getElementById('call-duration');
+        if (!durationElement) {
+            // Create duration display
+            durationElement = document.createElement('div');
+            durationElement.id = 'call-duration';
+            durationElement.className = 'call-duration';
+
+            const statusBar = document.querySelector('.status-bar');
+            if (statusBar) {
+                statusBar.appendChild(durationElement);
+            }
+        }
+
+        const formattedTime = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+        const freeTimeLeft = Math.max(0, this.freeTimeRemaining - (minutes * 60 + seconds));
+
+        if (freeTimeLeft > 0) {
+            const freeMinutes = Math.floor(freeTimeLeft / 60);
+            const freeSeconds = freeTimeLeft % 60;
+            durationElement.innerHTML = `<span class="time">${formattedTime}</span> <span class="free-time">(бесплатно: ${freeMinutes}:${String(freeSeconds).padStart(2, '0')})</span>`;
+        } else {
+            durationElement.innerHTML = `<span class="time">${formattedTime}</span> <span class="paid-time">(💎 ${this.currencyConfig.pricing.pricePerMinute}/мин)</span>`;
+        }
     }
 }
 

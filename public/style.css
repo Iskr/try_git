@@ -1068,3 +1068,70 @@ h1 {
 .video-wrapper:hover .volume-badge.visible {
     opacity: 1;
 }
+
+/* Currency System - Balance Display */
+.balance-display {
+    margin: 16px 0;
+    padding: 12px 24px;
+    background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+    border-radius: var(--radius-lg);
+    border: 2px solid rgba(102, 126, 234, 0.2);
+    animation: fadeIn 0.5s ease-in;
+}
+
+.balance-amount {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--primary-color);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+
+/* Call Duration Display */
+.call-duration {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    padding: 4px 12px;
+    background: rgba(102, 126, 234, 0.1);
+    border-radius: var(--radius-full);
+    animation: fadeIn 0.3s ease-in;
+}
+
+.call-duration .time {
+    font-family: 'Courier New', monospace;
+    font-weight: 700;
+    color: var(--text-color);
+}
+
+.call-duration .free-time {
+    color: var(--success-color);
+    font-weight: 600;
+}
+
+.call-duration .paid-time {
+    color: var(--warning-color);
+    font-weight: 600;
+}
+
+/* Mobile adjustments for currency system */
+@media (max-width: 600px) {
+    .balance-display {
+        margin: 12px 0;
+        padding: 10px 20px;
+    }
+
+    .balance-amount {
+        font-size: 20px;
+    }
+
+    .call-duration {
+        font-size: 11px;
+        padding: 4px 10px;
+    }
+}
