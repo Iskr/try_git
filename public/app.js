@@ -270,24 +270,54 @@ class CallingApp {
 
         // Currency system
         this.currencyConfig = null;
-        this.userBalance = this.loadBalance();
+        this.userBalance = 0;
         this.callStartTime = null;
         this.callTimer = null;
         this.freeTimeRemaining = null;
         this.encryptionCostPaid = false;
         this.transcriptionEnabled = false;
 
+        // Authentication
+        this.authToken = localStorage.getItem('authToken');
+        this.username = null;
+        this.authenticated = false;
+
         this.initUI();
         this.loadCurrencyConfig();
-        this.connectWebSocket();
+
+        // Check if already logged in
+        if (this.authToken) {
+            this.connectWebSocket();
+        }
     }
 
     initUI() {
         // Screen elements
+        this.authScreen = document.getElementById('auth-screen');
         this.homeScreen = document.getElementById('home-screen');
         this.callScreen = document.getElementById('call-screen');
 
+        // Auth screen handlers
+        document.getElementById('login-tab').addEventListener('click', () => this.switchAuthTab('login'));
+        document.getElementById('register-tab').addEventListener('click', () => this.switchAuthTab('register'));
+        document.getElementById('login-submit-btn').addEventListener('click', () => this.handleLogin());
+        document.getElementById('register-submit-btn').addEventListener('click', () => this.handleRegister());
+
+        // Enter key submit for auth forms
+        ['login-username', 'login-password'].forEach(id => {
+            document.getElementById(id).addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') this.handleLogin();
+            });
+        });
+
+        ['register-username', 'register-password', 'register-password-confirm'].forEach(id => {
+            document.getElementById(id).addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') this.handleRegister();
+            });
+        });
+
         // Home screen buttons
+        document.getElementById('logout-btn').addEventListener('click', () => this.handleLogout());
         document.getElementById('create-call-btn').addEventListener('click', () => this.createCall());
         document.getElementById('join-call-btn').addEventListener('click', () => this.toggleJoinInput());
         document.getElementById('join-submit-btn').addEventListener('click', () => this.joinCall());
@@ -386,6 +416,15 @@ class CallingApp {
             console.log('WebSocket connected');
             this.reconnectAttempts = 0;
             this.reconnectDelay = 2000;
+
+            // Authenticate with server
+            if (this.authToken) {
+                this.ws.send(JSON.stringify({
+                    type: 'authenticate',
+                    token: this.authToken
+                }));
+            }
+
             this.startConnectionHealthMonitoring();
         };
 
@@ -477,6 +516,28 @@ class CallingApp {
         console.log('Received message:', message.type);
 
         switch (message.type) {
+            case 'authenticated':
+                this.authenticated = true;
+                this.username = message.username;
+                this.userBalance = message.balance;
+                console.log(`Authenticated as ${this.username}, balance: ${this.userBalance}`);
+                this.showHomeScreen();
+                break;
+
+            case 'auth-error':
+                console.error('Authentication failed:', message.error);
+                this.handleLogout();
+                this.showToast('Ошибка авторизации. Войдите снова.');
+                break;
+
+            case 'balance-updated':
+                this.userBalance = message.balance;
+                this.updateBalanceDisplay();
+                if (message.success === false) {
+                    this.showToast('Недостаточно средств');
+                }
+                break;
+
             case 'pong':
                 // Update last pong time for connection health monitoring
                 this.lastPongTime = Date.now();
@@ -1649,6 +1710,161 @@ class CallingApp {
         return result;
     }
 
+    // Authentication Methods
+    switchAuthTab(tab) {
+        const loginTab = document.getElementById('login-tab');
+        const registerTab = document.getElementById('register-tab');
+        const loginForm = document.getElementById('login-form');
+        const registerForm = document.getElementById('register-form');
+
+        if (tab === 'login') {
+            loginTab.classList.add('active');
+            registerTab.classList.remove('active');
+            loginForm.classList.add('active');
+            registerForm.classList.remove('active');
+        } else {
+            loginTab.classList.remove('active');
+            registerTab.classList.add('active');
+            loginForm.classList.remove('active');
+            registerForm.classList.add('active');
+        }
+    }
+
+    async handleLogin() {
+        const username = document.getElementById('login-username').value.trim();
+        const password = document.getElementById('login-password').value;
+
+        if (!username || !password) {
+            this.showToast('Заполните все поля');
+            return;
+        }
+
+        try {
+            const response = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || 'Ошибка входа');
+            }
+
+            // Save token and user info
+            this.authToken = data.token;
+            localStorage.setItem('authToken', data.token);
+
+            // Connect WebSocket
+            this.connectWebSocket();
+
+            this.showToast('Вход выполнен');
+        } catch (error) {
+            console.error('Login error:', error);
+            this.showToast(error.message);
+        }
+    }
+
+    async handleRegister() {
+        const username = document.getElementById('register-username').value.trim();
+        const password = document.getElementById('register-password').value;
+        const passwordConfirm = document.getElementById('register-password-confirm').value;
+
+        if (!username || !password || !passwordConfirm) {
+            this.showToast('Заполните все поля');
+            return;
+        }
+
+        if (password !== passwordConfirm) {
+            this.showToast('Пароли не совпадают');
+            return;
+        }
+
+        if (username.length < 3) {
+            this.showToast('Имя пользователя должно быть не менее 3 символов');
+            return;
+        }
+
+        if (password.length < 6) {
+            this.showToast('Пароль должен быть не менее 6 символов');
+            return;
+        }
+
+        try {
+            const response = await fetch('/api/auth/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.error || 'Ошибка регистрации');
+            }
+
+            // Save token and user info
+            this.authToken = data.token;
+            localStorage.setItem('authToken', data.token);
+
+            // Connect WebSocket
+            this.connectWebSocket();
+
+            this.showToast(`Регистрация успешна! Вам начислено ${data.user.balance}💎`);
+        } catch (error) {
+            console.error('Register error:', error);
+            this.showToast(error.message);
+        }
+    }
+
+    handleLogout() {
+        // Clear auth data
+        this.authToken = null;
+        this.username = null;
+        this.authenticated = false;
+        this.userBalance = 0;
+        localStorage.removeItem('authToken');
+
+        // Close WebSocket if connected
+        if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+        }
+
+        // Stop timers
+        this.stopCallTimer();
+        this.stopConnectionHealthMonitoring();
+
+        // Show auth screen
+        this.authScreen.classList.add('active');
+        this.homeScreen.classList.remove('active');
+        this.callScreen.classList.remove('active');
+
+        // Clear forms
+        document.getElementById('login-username').value = '';
+        document.getElementById('login-password').value = '';
+        document.getElementById('register-username').value = '';
+        document.getElementById('register-password').value = '';
+        document.getElementById('register-password-confirm').value = '';
+
+        this.showToast('Вы вышли из системы');
+    }
+
+    showHomeScreen() {
+        this.authScreen.classList.remove('active');
+        this.homeScreen.classList.add('active');
+
+        // Update welcome message
+        const welcomeMsg = document.getElementById('welcome-message');
+        if (welcomeMsg && this.username) {
+            welcomeMsg.textContent = `Привет, ${this.username}!`;
+        }
+
+        // Update balance display
+        this.updateBalanceDisplay();
+    }
+
     // Currency System Methods
     async loadCurrencyConfig() {
         try {
@@ -1671,29 +1887,39 @@ class CallingApp {
         }
     }
 
-    loadBalance() {
-        const saved = localStorage.getItem('userBalance');
-        if (saved !== null) {
-            return parseInt(saved, 10);
-        }
-        return 100; // Default initial balance
-    }
-
-    saveBalance() {
-        localStorage.setItem('userBalance', this.userBalance.toString());
-        this.updateBalanceDisplay();
-    }
-
     deductBalance(amount, reason) {
-        if (this.userBalance >= amount) {
+        // Check local balance first
+        if (this.userBalance < amount) {
+            this.showToast(`Недостаточно 💎. Нужно: ${amount}, есть: ${this.userBalance}`);
+            return false;
+        }
+
+        // Send deduction request to server
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: 'deduct-balance',
+                amount,
+                reason
+            }));
+
+            // Optimistically update local balance
             this.userBalance -= amount;
-            this.saveBalance();
+            this.updateBalanceDisplay();
             console.log(`Deducted ${amount} gems for ${reason}. New balance: ${this.userBalance}`);
             this.showToast(`-${amount}💎 ${reason}`);
             return true;
         } else {
-            this.showToast(`Недостаточно 💎. Нужно: ${amount}, есть: ${this.userBalance}`);
+            this.showToast('Нет подключения к серверу');
             return false;
+        }
+    }
+
+    syncBalance() {
+        // Request balance update from server
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: 'get-balance'
+            }));
         }
     }
 

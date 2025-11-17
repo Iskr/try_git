@@ -10,15 +10,59 @@
 </head>
 <body>
     <div class="container">
-        <!-- Home Screen -->
-        <div id="home-screen" class="screen active">
+        <!-- Auth Screen -->
+        <div id="auth-screen" class="screen active">
             <div class="logo">
                 <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
                 </svg>
             </div>
             <h1>Звонки</h1>
-            <p class="subtitle">Быстрые и простые звонки</p>
+            <p class="subtitle">Войдите или зарегистрируйтесь</p>
+
+            <!-- Auth tabs -->
+            <div class="auth-tabs">
+                <button id="login-tab" class="auth-tab active">Вход</button>
+                <button id="register-tab" class="auth-tab">Регистрация</button>
+            </div>
+
+            <!-- Login form -->
+            <div id="login-form" class="auth-form active">
+                <div class="input-group">
+                    <input type="text" id="login-username" placeholder="Имя пользователя" autocomplete="username" />
+                </div>
+                <div class="input-group">
+                    <input type="password" id="login-password" placeholder="Пароль" autocomplete="current-password" />
+                </div>
+                <button id="login-submit-btn" class="btn btn-primary">Войти</button>
+            </div>
+
+            <!-- Register form -->
+            <div id="register-form" class="auth-form">
+                <div class="input-group">
+                    <input type="text" id="register-username" placeholder="Имя пользователя (мин. 3 символа)" autocomplete="username" />
+                </div>
+                <div class="input-group">
+                    <input type="password" id="register-password" placeholder="Пароль (мин. 6 символов)" autocomplete="new-password" />
+                </div>
+                <div class="input-group">
+                    <input type="password" id="register-password-confirm" placeholder="Подтвердите пароль" autocomplete="new-password" />
+                </div>
+                <button id="register-submit-btn" class="btn btn-primary">Зарегистрироваться</button>
+            </div>
+        </div>
+
+        <!-- Home Screen -->
+        <div id="home-screen" class="screen">
+            <div class="logo">
+                <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+                </svg>
+            </div>
+            <h1>Звонки</h1>
+            <p class="subtitle" id="welcome-message">Быстрые и простые звонки</p>
+
+            <button id="logout-btn" class="btn btn-text">Выйти</button>
 
             <div class="button-group">
                 <button id="create-call-btn" class="btn btn-primary">
