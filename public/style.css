@@ -1068,3 +1068,172 @@ h1 {
 .video-wrapper:hover .volume-badge.visible {
     opacity: 1;
 }
+
+/* Currency System - Balance Display */
+.balance-display {
+    margin: 16px 0;
+    padding: 12px 24px;
+    background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+    border-radius: var(--radius-lg);
+    border: 2px solid rgba(102, 126, 234, 0.2);
+    animation: fadeIn 0.5s ease-in;
+}
+
+.balance-amount {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--primary-color);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+}
+
+/* Call Duration Display */
+.call-duration {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    padding: 4px 12px;
+    background: rgba(102, 126, 234, 0.1);
+    border-radius: var(--radius-full);
+    animation: fadeIn 0.3s ease-in;
+}
+
+.call-duration .time {
+    font-family: 'Courier New', monospace;
+    font-weight: 700;
+    color: var(--text-color);
+}
+
+.call-duration .free-time {
+    color: var(--success-color);
+    font-weight: 600;
+}
+
+.call-duration .paid-time {
+    color: var(--warning-color);
+    font-weight: 600;
+}
+
+/* Mobile adjustments for currency system */
+@media (max-width: 600px) {
+    .balance-display {
+        margin: 12px 0;
+        padding: 10px 20px;
+    }
+
+    .balance-amount {
+        font-size: 20px;
+    }
+
+    .call-duration {
+        font-size: 11px;
+        padding: 4px 10px;
+    }
+}
+
+/* Authentication Screen */
+#auth-screen {
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+}
+
+.auth-tabs {
+    display: flex;
+    gap: 8px;
+    margin: 24px 0 16px;
+}
+
+.auth-tab {
+    flex: 1;
+    padding: 12px 24px;
+    background: transparent;
+    border: 2px solid var(--border-color);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.auth-tab:hover {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+}
+
+.auth-tab.active {
+    background: var(--primary-gradient);
+    border-color: transparent;
+    color: white;
+    box-shadow: var(--shadow-md);
+}
+
+.auth-form {
+    display: none;
+    flex-direction: column;
+    gap: 12px;
+    width: 100%;
+    max-width: 400px;
+    margin: 0 auto;
+}
+
+.auth-form.active {
+    display: flex;
+}
+
+.input-group {
+    width: 100%;
+}
+
+.input-group input {
+    width: 100%;
+    padding: 14px 18px;
+    font-size: 15px;
+    border: 2px solid var(--border-color);
+    border-radius: var(--radius-md);
+    background: var(--surface-color);
+    color: var(--text-color);
+    transition: all 0.2s ease;
+    font-family: inherit;
+}
+
+.input-group input:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+}
+
+.input-group input::placeholder {
+    color: var(--text-secondary);
+}
+
+.btn-text {
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    padding: 8px 16px;
+    font-size: 14px;
+    margin-top: 8px;
+}
+
+.btn-text:hover {
+    background: rgba(102, 126, 234, 0.1);
+    color: var(--primary-color);
+}
+
+/* Mobile adjustments for auth */
+@media (max-width: 600px) {
+    .auth-tabs {
+        flex-direction: column;
+    }
+
+    .auth-form {
+        max-width: 100%;
+    }
+}
