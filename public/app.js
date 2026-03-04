@@ -61,29 +61,41 @@ const MEDIA_CONSTRAINTS = {
     }
 };
 
-// Frame Encryption using Web Crypto API and Insertable Streams
+// Frame Encryption using Web Crypto API
+// Supports both Chrome (createEncodedStreams) and Safari/Firefox (RTCRtpScriptTransform)
 class FrameCryptor {
     constructor() {
         this.encryptionKey = null;
         this.encryptionEnabled = false;
-        this.senderTransforms = new Map(); // Map<trackId, TransformStream>
-        this.receiverTransforms = new Map(); // Map<trackId, TransformStream>
-        this.frameCounters = new Map(); // Map<trackId, counter> for IV generation
+        this.rawKeyData = null; // Raw key bytes for sharing with workers
+        this.senderTransforms = new Map();
+        this.receiverTransforms = new Map();
+        this.frameCounters = new Map();
+        this.workerPorts = []; // MessagePorts to workers (for RTCRtpScriptTransform)
+
+        // Detect which API is available
+        this.useScriptTransform = typeof RTCRtpScriptTransform !== 'undefined';
+        this.useLegacyStreams = !this.useScriptTransform &&
+            typeof RTCRtpSender !== 'undefined' &&
+            typeof RTCRtpSender.prototype.createEncodedStreams === 'function';
+    }
+
+    get supported() {
+        return this.useScriptTransform || this.useLegacyStreams;
     }
 
     async generateKey() {
-        // Generate AES-GCM 128-bit key
         this.encryptionKey = await crypto.subtle.generateKey(
             { name: 'AES-GCM', length: 128 },
             true,
             ['encrypt', 'decrypt']
         );
-        console.log('Encryption key generated');
+        this.rawKeyData = new Uint8Array(await crypto.subtle.exportKey('raw', this.encryptionKey));
         return this.encryptionKey;
     }
 
     async setKey(keyData) {
-        // Import key from raw data
+        this.rawKeyData = new Uint8Array(keyData);
         this.encryptionKey = await crypto.subtle.importKey(
             'raw',
             keyData,
@@ -91,39 +103,43 @@ class FrameCryptor {
             true,
             ['encrypt', 'decrypt']
         );
-        console.log('Encryption key imported');
+        this._syncKeyToWorkers();
     }
 
     async exportKey() {
         if (!this.encryptionKey) {
             await this.generateKey();
         }
-        const exported = await crypto.subtle.exportKey('raw', this.encryptionKey);
-        return new Uint8Array(exported);
+        return new Uint8Array(this.rawKeyData);
     }
 
     enable() {
         this.encryptionEnabled = true;
-        console.log('Encryption enabled');
+        // Notify all workers
+        this.workerPorts.forEach(port => port.postMessage({ type: 'enable' }));
     }
 
     disable() {
         this.encryptionEnabled = false;
-        console.log('Encryption disabled');
+        this.workerPorts.forEach(port => port.postMessage({ type: 'disable' }));
     }
 
-    getIV(trackId, counter) {
-        // Generate 12-byte IV (nonce) for AES-GCM
-        // Format: [trackId hash (8 bytes)] + [counter (4 bytes)]
-        const iv = new Uint8Array(12);
+    // Send current key to all workers
+    _syncKeyToWorkers() {
+        if (!this.rawKeyData) return;
+        const keyArray = Array.from(this.rawKeyData);
+        this.workerPorts.forEach(port => port.postMessage({ type: 'setKey', keyData: keyArray }));
+    }
 
-        // Simple hash of trackId
+    // --- Legacy API (Chrome): createEncodedStreams ---
+
+    getIV(trackId, counter) {
+        const iv = new Uint8Array(12);
         const hash = trackId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
         const view = new DataView(iv.buffer);
         view.setUint32(0, hash);
         view.setUint32(4, hash >> 8);
         view.setUint32(8, counter);
-
         return iv;
     }
 
@@ -132,33 +148,18 @@ class FrameCryptor {
             controller.enqueue(encodedFrame);
             return;
         }
-
         try {
-            // Get frame data
             const data = new Uint8Array(encodedFrame.data);
-
-            // Get or initialize counter
             if (!this.frameCounters.has(trackId)) {
                 this.frameCounters.set(trackId, 0);
             }
             const counter = this.frameCounters.get(trackId);
             this.frameCounters.set(trackId, counter + 1);
-
-            // Generate IV
             const iv = this.getIV(trackId, counter);
-
-            // Encrypt
-            const encrypted = await crypto.subtle.encrypt(
-                { name: 'AES-GCM', iv: iv },
-                this.encryptionKey,
-                data
-            );
-
-            // Create new frame with encrypted data + IV prepended
+            const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.encryptionKey, data);
             const newData = new Uint8Array(12 + encrypted.byteLength);
             newData.set(iv, 0);
             newData.set(new Uint8Array(encrypted), 12);
-
             encodedFrame.data = newData.buffer;
             controller.enqueue(encodedFrame);
         } catch (error) {
@@ -172,76 +173,122 @@ class FrameCryptor {
             controller.enqueue(encodedFrame);
             return;
         }
-
         try {
             const data = new Uint8Array(encodedFrame.data);
-
-            // Extract IV (first 12 bytes)
             const iv = data.slice(0, 12);
             const encryptedData = data.slice(12);
-
-            // Decrypt
-            const decrypted = await crypto.subtle.decrypt(
-                { name: 'AES-GCM', iv: iv },
-                this.encryptionKey,
-                encryptedData
-            );
-
+            const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, this.encryptionKey, encryptedData);
             encodedFrame.data = decrypted;
             controller.enqueue(encodedFrame);
         } catch (error) {
-            console.error('Decryption error:', error);
             // Skip frame if decryption fails
         }
     }
 
-    setupSenderTransform(sender, trackId) {
-        if (!sender.createEncodedStreams) {
-            console.warn('Insertable Streams not supported');
-            return;
-        }
-
+    _setupSenderLegacy(sender, trackId) {
         const streams = sender.createEncodedStreams();
         const transformStream = new TransformStream({
             transform: async (encodedFrame, controller) => {
                 await this.encryptFrame(encodedFrame, controller, trackId);
             }
         });
-
-        streams.readable
-            .pipeThrough(transformStream)
-            .pipeTo(streams.writable);
-
+        streams.readable.pipeThrough(transformStream).pipeTo(streams.writable);
         this.senderTransforms.set(trackId, transformStream);
-        console.log('Sender transform setup for:', trackId);
     }
 
-    setupReceiverTransform(receiver) {
-        if (!receiver.createEncodedStreams) {
-            console.warn('Insertable Streams not supported');
-            return;
-        }
-
+    _setupReceiverLegacy(receiver) {
         const streams = receiver.createEncodedStreams();
         const transformStream = new TransformStream({
             transform: async (encodedFrame, controller) => {
                 await this.decryptFrame(encodedFrame, controller);
             }
         });
-
-        streams.readable
-            .pipeThrough(transformStream)
-            .pipeTo(streams.writable);
-
+        streams.readable.pipeThrough(transformStream).pipeTo(streams.writable);
         const trackId = receiver.track?.id || 'unknown';
         this.receiverTransforms.set(trackId, transformStream);
-        console.log('Receiver transform setup for:', trackId);
+    }
+
+    // --- Standard API (Safari/Firefox): RTCRtpScriptTransform ---
+
+    _setupSenderScriptTransform(sender, trackId) {
+        const worker = new Worker('encryption-worker.js');
+        const channel = new MessageChannel();
+
+        sender.transform = new RTCRtpScriptTransform(
+            worker,
+            { name: 'sender', trackId, port: channel.port2 },
+            [channel.port2]
+        );
+
+        channel.port1.start();
+        this.workerPorts.push(channel.port1);
+
+        // Send current state to new worker
+        if (this.rawKeyData) {
+            channel.port1.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
+        }
+        if (this.encryptionEnabled) {
+            channel.port1.postMessage({ type: 'enable' });
+        }
+
+        this.senderTransforms.set(trackId, { worker, port: channel.port1 });
+    }
+
+    _setupReceiverScriptTransform(receiver) {
+        const trackId = receiver.track?.id || 'unknown';
+        const worker = new Worker('encryption-worker.js');
+        const channel = new MessageChannel();
+
+        receiver.transform = new RTCRtpScriptTransform(
+            worker,
+            { name: 'receiver', trackId, port: channel.port2 },
+            [channel.port2]
+        );
+
+        channel.port1.start();
+        this.workerPorts.push(channel.port1);
+
+        // Send current state to new worker
+        if (this.rawKeyData) {
+            channel.port1.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
+        }
+        if (this.encryptionEnabled) {
+            channel.port1.postMessage({ type: 'enable' });
+        }
+
+        this.receiverTransforms.set(trackId, { worker, port: channel.port1 });
+    }
+
+    // --- Public API ---
+
+    setupSenderTransform(sender, trackId) {
+        if (this.useScriptTransform) {
+            this._setupSenderScriptTransform(sender, trackId);
+        } else if (this.useLegacyStreams) {
+            this._setupSenderLegacy(sender, trackId);
+        }
+    }
+
+    setupReceiverTransform(receiver) {
+        if (this.useScriptTransform) {
+            this._setupReceiverScriptTransform(receiver);
+        } else if (this.useLegacyStreams) {
+            this._setupReceiverLegacy(receiver);
+        }
     }
 
     clearTransforms() {
+        // Terminate workers
+        this.senderTransforms.forEach(entry => {
+            if (entry.worker) entry.worker.terminate();
+        });
+        this.receiverTransforms.forEach(entry => {
+            if (entry.worker) entry.worker.terminate();
+        });
         this.senderTransforms.clear();
         this.receiverTransforms.clear();
         this.frameCounters.clear();
+        this.workerPorts = [];
     }
 }
 
@@ -556,6 +603,38 @@ class CallingApp {
         wrapper.appendChild(video);
         wrapper.appendChild(label);
 
+        if (isLocal) {
+            // Mirror local video by default and add toggle
+            const isMirrored = localStorage.getItem('localVideoMirrored') !== 'false';
+            if (isMirrored) {
+                wrapper.classList.add('mirrored');
+            }
+
+            // Add click handler to show controls on local video too
+            wrapper.addEventListener('click', () => {
+                const wasShowing = wrapper.classList.contains('show-controls');
+                document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
+                    w.classList.remove('show-controls');
+                });
+                if (!wasShowing) {
+                    wrapper.classList.add('show-controls');
+                }
+            });
+
+            const mirrorBtn = document.createElement('button');
+            mirrorBtn.className = 'mirror-btn' + (isMirrored ? ' active' : '');
+            mirrorBtn.title = 'Зеркалировать видео';
+            mirrorBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="3" x2="12" y2="21" stroke-dasharray="2 2"/></svg>';
+            mirrorBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                wrapper.classList.toggle('mirrored');
+                const nowMirrored = wrapper.classList.contains('mirrored');
+                mirrorBtn.classList.toggle('active', nowMirrored);
+                localStorage.setItem('localVideoMirrored', nowMirrored);
+            });
+            wrapper.appendChild(mirrorBtn);
+        }
+
         // Add volume control button for remote participants
         if (!isLocal) {
             // Add click handler to show controls
@@ -678,7 +757,12 @@ class CallingApp {
     }
 
     createPeerConnection(remoteClientId) {
-        const pc = new RTCPeerConnection(config);
+        const pcConfig = { ...config };
+        // Chrome requires encodedInsertableStreams for createEncodedStreams API
+        if (this.frameCryptor.useLegacyStreams) {
+            pcConfig.encodedInsertableStreams = true;
+        }
+        const pc = new RTCPeerConnection(pcConfig);
         this.peerConnections.set(remoteClientId, pc);
 
         // Add local tracks and setup encryption
@@ -966,16 +1050,11 @@ class CallingApp {
         });
     }
 
-    supportsInsertableStreams() {
-        return typeof RTCRtpSender !== 'undefined' &&
-            typeof RTCRtpSender.prototype.createEncodedStreams === 'function';
-    }
-
     async toggleEncryption() {
         const enabling = !this.frameCryptor.encryptionEnabled;
 
         if (enabling) {
-            if (!this.supportsInsertableStreams()) {
+            if (!this.frameCryptor.supported) {
                 this.showToast('Шифрование не поддерживается в этом браузере');
                 return;
             }
