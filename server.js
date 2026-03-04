@@ -25,9 +25,90 @@ app.use(express.static('public'));
 // Store active rooms and connections
 const rooms = new Map();
 
+function handleJoin(ws, roomId, clientId) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, new Map());
+  }
+
+  const room = rooms.get(roomId);
+  room.set(clientId, ws);
+
+  // Notify existing participants
+  const participants = Array.from(room.keys()).filter(id => id !== clientId);
+
+  ws.send(JSON.stringify({
+    type: 'joined',
+    roomId: roomId,
+    clientId: clientId,
+    participants: participants
+  }));
+
+  // Notify others about new participant
+  broadcast(roomId, {
+    type: 'peer-joined',
+    clientId: clientId
+  }, clientId);
+
+  console.log(`Client ${clientId} joined room ${roomId}. Total participants: ${room.size}`);
+}
+
+function handleSignaling(data, roomId, senderId) {
+  if (!roomId || !rooms.has(roomId)) {
+    return;
+  }
+
+  const room = rooms.get(roomId);
+  const targetClient = room.get(data.targetId);
+
+  if (targetClient && targetClient.readyState === WebSocket.OPEN) {
+    targetClient.send(JSON.stringify({
+      ...data,
+      senderId: senderId
+    }));
+  }
+}
+
+function handleLeave(roomId, clientId) {
+  if (!roomId || !rooms.has(roomId)) {
+    return;
+  }
+
+  const room = rooms.get(roomId);
+  room.delete(clientId);
+
+  // Notify others
+  broadcast(roomId, {
+    type: 'peer-left',
+    clientId: clientId
+  }, clientId);
+
+  // Clean up empty rooms
+  if (room.size === 0) {
+    rooms.delete(roomId);
+    console.log(`Room ${roomId} deleted (empty)`);
+  }
+
+  console.log(`Client ${clientId} left room ${roomId}`);
+}
+
+function broadcast(roomId, message, excludeId) {
+  if (!rooms.has(roomId)) {
+    return;
+  }
+
+  const room = rooms.get(roomId);
+  const messageStr = JSON.stringify(message);
+
+  room.forEach((client, id) => {
+    if (id !== excludeId && client.readyState === WebSocket.OPEN) {
+      client.send(messageStr);
+    }
+  });
+}
+
 wss.on('connection', (ws) => {
   let currentRoom = null;
-  let clientId = uuidv4();
+  const clientId = uuidv4();
 
   console.log(`Client connected: ${clientId}`);
 
@@ -37,6 +118,7 @@ wss.on('connection', (ws) => {
 
       switch (data.type) {
         case 'join':
+          currentRoom = data.roomId;
           handleJoin(ws, data.roomId, clientId);
           break;
 
@@ -64,89 +146,6 @@ wss.on('connection', (ws) => {
       handleLeave(currentRoom, clientId);
     }
   });
-
-  function handleJoin(ws, roomId, clientId) {
-    currentRoom = roomId;
-
-    if (!rooms.has(roomId)) {
-      rooms.set(roomId, new Map());
-    }
-
-    const room = rooms.get(roomId);
-    room.set(clientId, ws);
-
-    // Notify existing participants
-    const participants = Array.from(room.keys()).filter(id => id !== clientId);
-
-    ws.send(JSON.stringify({
-      type: 'joined',
-      roomId: roomId,
-      clientId: clientId,
-      participants: participants
-    }));
-
-    // Notify others about new participant
-    broadcast(roomId, {
-      type: 'peer-joined',
-      clientId: clientId
-    }, clientId);
-
-    console.log(`Client ${clientId} joined room ${roomId}. Total participants: ${room.size}`);
-  }
-
-  function handleSignaling(data, roomId, senderId) {
-    if (!roomId || !rooms.has(roomId)) {
-      return;
-    }
-
-    const room = rooms.get(roomId);
-    const targetClient = room.get(data.targetId);
-
-    if (targetClient && targetClient.readyState === WebSocket.OPEN) {
-      targetClient.send(JSON.stringify({
-        ...data,
-        senderId: senderId
-      }));
-    }
-  }
-
-  function handleLeave(roomId, clientId) {
-    if (!roomId || !rooms.has(roomId)) {
-      return;
-    }
-
-    const room = rooms.get(roomId);
-    room.delete(clientId);
-
-    // Notify others
-    broadcast(roomId, {
-      type: 'peer-left',
-      clientId: clientId
-    }, clientId);
-
-    // Clean up empty rooms
-    if (room.size === 0) {
-      rooms.delete(roomId);
-      console.log(`Room ${roomId} deleted (empty)`);
-    }
-
-    console.log(`Client ${clientId} left room ${roomId}`);
-  }
-
-  function broadcast(roomId, message, excludeId) {
-    if (!rooms.has(roomId)) {
-      return;
-    }
-
-    const room = rooms.get(roomId);
-    const messageStr = JSON.stringify(message);
-
-    room.forEach((client, id) => {
-      if (id !== excludeId && client.readyState === WebSocket.OPEN) {
-        client.send(messageStr);
-      }
-    });
-  }
 });
 
 server.listen(PORT, '0.0.0.0', () => {

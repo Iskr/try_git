@@ -229,7 +229,7 @@ h1 {
     margin-top: 20px;
     width: 100%;
     max-width: 400px;
-    animation: slideDown 0.3s ease;
+    animation: fadeIn 0.3s ease;
 }
 
 @media (min-width: 769px) {
@@ -381,7 +381,7 @@ h1 {
     padding: 8px;
     z-index: 200;
     min-width: 180px;
-    animation: slideDown 0.2s ease;
+    animation: fadeIn 0.2s ease;
     border: 1px solid var(--border-color);
 }
 
@@ -584,22 +584,6 @@ h1 {
     font-size: 12px;
 }
 
-/* Fallback for old single video display */
-#remote-video {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    background-color: #1a1a1a;
-    display: none;
-}
-
-#local-video {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    background-color: #1a1a1a;
-    display: none;
-}
 
 .controls {
     display: flex;
@@ -726,26 +710,9 @@ h1 {
     }
 }
 
-@keyframes slideDown {
-    from {
-        opacity: 0;
-        transform: translateY(-10px);
-    }
-    to {
-        opacity: 1;
-        transform: translateY(0);
-    }
-}
 
 /* Mobile optimizations */
 @media (max-width: 480px) {
-    #local-video {
-        width: 100px;
-        height: 133px;
-        bottom: 16px;
-        right: 16px;
-    }
-
     .controls {
         padding: 16px;
         gap: 12px;
@@ -759,13 +726,6 @@ h1 {
 
 /* Landscape mode */
 @media (orientation: landscape) and (max-height: 500px) {
-    #local-video {
-        width: 80px;
-        height: 107px;
-        bottom: 12px;
-        right: 12px;
-    }
-
     .controls {
         padding: 12px;
     }
