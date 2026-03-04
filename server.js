@@ -109,17 +109,34 @@ function broadcast(roomId, message, excludeId) {
 wss.on('connection', (ws) => {
   let currentRoom = null;
   const clientId = uuidv4();
+  ws.isAlive = true;
 
   console.log(`Client connected: ${clientId}`);
+
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
 
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
 
+      // Client-side ping (for browsers that don't expose WebSocket pong)
+      if (data.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+
       switch (data.type) {
         case 'join':
           currentRoom = data.roomId;
           handleJoin(ws, data.roomId, clientId);
+          break;
+
+        case 'rejoin':
+          // Rejoin after reconnect — reuse clientId from client
+          currentRoom = data.roomId;
+          handleJoin(ws, data.roomId, data.clientId || clientId);
           break;
 
         case 'offer':
@@ -146,6 +163,21 @@ wss.on('connection', (ws) => {
       handleLeave(currentRoom, clientId);
     }
   });
+});
+
+// Heartbeat: ping all clients every 30 seconds, terminate unresponsive ones
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      return ws.terminate();
+    }
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+wss.on('close', () => {
+  clearInterval(heartbeatInterval);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
