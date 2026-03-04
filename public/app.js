@@ -67,11 +67,11 @@ class FrameCryptor {
     constructor() {
         this.encryptionKey = null;
         this.encryptionEnabled = false;
-        this.rawKeyData = null; // Raw key bytes for sharing with workers
+        this.rawKeyData = null;
         this.senderTransforms = new Map();
         this.receiverTransforms = new Map();
         this.frameCounters = new Map();
-        this.workerPorts = []; // MessagePorts to workers (for RTCRtpScriptTransform)
+        this.workers = []; // Worker instances for RTCRtpScriptTransform
 
         // Detect which API is available
         this.useScriptTransform = typeof RTCRtpScriptTransform !== 'undefined';
@@ -115,20 +115,18 @@ class FrameCryptor {
 
     enable() {
         this.encryptionEnabled = true;
-        // Notify all workers
-        this.workerPorts.forEach(port => port.postMessage({ type: 'enable' }));
+        this.workers.forEach(w => w.postMessage({ type: 'enable' }));
     }
 
     disable() {
         this.encryptionEnabled = false;
-        this.workerPorts.forEach(port => port.postMessage({ type: 'disable' }));
+        this.workers.forEach(w => w.postMessage({ type: 'disable' }));
     }
 
-    // Send current key to all workers
     _syncKeyToWorkers() {
         if (!this.rawKeyData) return;
         const keyArray = Array.from(this.rawKeyData);
-        this.workerPorts.forEach(port => port.postMessage({ type: 'setKey', keyData: keyArray }));
+        this.workers.forEach(w => w.postMessage({ type: 'setKey', keyData: keyArray }));
     }
 
     // --- Legacy API (Chrome): createEncodedStreams ---
@@ -212,51 +210,45 @@ class FrameCryptor {
 
     _setupSenderScriptTransform(sender, trackId) {
         const worker = new Worker('encryption-worker.js');
-        const channel = new MessageChannel();
 
         sender.transform = new RTCRtpScriptTransform(
             worker,
-            { name: 'sender', trackId, port: channel.port2 },
-            [channel.port2]
+            { name: 'sender', trackId }
         );
 
-        channel.port1.start();
-        this.workerPorts.push(channel.port1);
+        this.workers.push(worker);
 
         // Send current state to new worker
         if (this.rawKeyData) {
-            channel.port1.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
+            worker.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
         }
         if (this.encryptionEnabled) {
-            channel.port1.postMessage({ type: 'enable' });
+            worker.postMessage({ type: 'enable' });
         }
 
-        this.senderTransforms.set(trackId, { worker, port: channel.port1 });
+        this.senderTransforms.set(trackId, { worker });
     }
 
     _setupReceiverScriptTransform(receiver) {
         const trackId = receiver.track?.id || 'unknown';
         const worker = new Worker('encryption-worker.js');
-        const channel = new MessageChannel();
 
         receiver.transform = new RTCRtpScriptTransform(
             worker,
-            { name: 'receiver', trackId, port: channel.port2 },
-            [channel.port2]
+            { name: 'receiver', trackId }
         );
 
-        channel.port1.start();
-        this.workerPorts.push(channel.port1);
+        this.workers.push(worker);
 
         // Send current state to new worker
         if (this.rawKeyData) {
-            channel.port1.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
+            worker.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
         }
         if (this.encryptionEnabled) {
-            channel.port1.postMessage({ type: 'enable' });
+            worker.postMessage({ type: 'enable' });
         }
 
-        this.receiverTransforms.set(trackId, { worker, port: channel.port1 });
+        this.receiverTransforms.set(trackId, { worker });
     }
 
     // --- Public API ---
@@ -284,17 +276,11 @@ class FrameCryptor {
     }
 
     clearTransforms() {
-        // Terminate workers
-        this.senderTransforms.forEach(entry => {
-            if (entry.worker) entry.worker.terminate();
-        });
-        this.receiverTransforms.forEach(entry => {
-            if (entry.worker) entry.worker.terminate();
-        });
+        this.workers.forEach(w => w.terminate());
+        this.workers = [];
         this.senderTransforms.clear();
         this.receiverTransforms.clear();
         this.frameCounters.clear();
-        this.workerPorts = [];
     }
 }
 
