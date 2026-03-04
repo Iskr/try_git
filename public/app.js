@@ -262,6 +262,9 @@ class FrameCryptor {
     // --- Public API ---
 
     setupSenderTransform(sender, trackId) {
+        // Don't set up twice for the same track (legacy can only be called once)
+        if (this.senderTransforms.has(trackId)) return;
+
         if (this.useScriptTransform) {
             this._setupSenderScriptTransform(sender, trackId);
         } else if (this.useLegacyStreams) {
@@ -270,6 +273,9 @@ class FrameCryptor {
     }
 
     setupReceiverTransform(receiver) {
+        const trackId = receiver.track?.id || 'unknown';
+        if (this.receiverTransforms.has(trackId)) return;
+
         if (this.useScriptTransform) {
             this._setupReceiverScriptTransform(receiver);
         } else if (this.useLegacyStreams) {
@@ -845,18 +851,19 @@ class CallingApp {
     createPeerConnection(remoteClientId) {
         const pcConfig = { ...config };
         // Chrome requires encodedInsertableStreams for createEncodedStreams API
-        // Always enable it so transforms can be set up ahead of time
+        // Always enable so we can set up transforms later when encryption is toggled
         if (this.frameCryptor.useLegacyStreams) {
             pcConfig.encodedInsertableStreams = true;
         }
         const pc = new RTCPeerConnection(pcConfig);
         this.peerConnections.set(remoteClientId, pc);
 
-        // Add local tracks — always set up encryption transforms
-        // (they pass through frames unmodified when encryption is disabled)
+        // Add local tracks
         this.localStream.getTracks().forEach(track => {
             const sender = pc.addTrack(track, this.localStream);
-            if (this.frameCryptor.supported) {
+
+            // Set up encryption transform only if encryption is already active
+            if (this.frameCryptor.encryptionEnabled) {
                 this.frameCryptor.setupSenderTransform(sender, track.id);
             }
         });
@@ -867,8 +874,8 @@ class CallingApp {
             this.addVideoStream(remoteClientId, event.streams[0], false);
             this.updateConnectionStatus(`${this.participants.size} участников`);
 
-            // Always set up receiver transforms (pass-through when disabled)
-            if (this.frameCryptor.supported && event.receiver) {
+            // Set up receiver transform only if encryption is already active
+            if (this.frameCryptor.encryptionEnabled && event.receiver) {
                 this.frameCryptor.setupReceiverTransform(event.receiver);
             }
         };
@@ -1186,6 +1193,19 @@ class CallingApp {
         indicator.classList.toggle('hidden', !enabled);
     }
 
+    setupEncryptionTransforms() {
+        this.peerConnections.forEach((pc) => {
+            pc.getSenders().forEach(sender => {
+                if (sender.track) {
+                    this.frameCryptor.setupSenderTransform(sender, sender.track.id);
+                }
+            });
+            pc.getReceivers().forEach(receiver => {
+                this.frameCryptor.setupReceiverTransform(receiver);
+            });
+        });
+    }
+
     async toggleEncryption() {
         const enabling = !this.frameCryptor.encryptionEnabled;
 
@@ -1195,17 +1215,22 @@ class CallingApp {
                 return;
             }
 
-            // Generate and share encryption key, then enable
+            // Generate key and share it
             const keyData = await this.frameCryptor.exportKey();
             await this.broadcastEncryptionKey(keyData);
+
+            // Set up transforms for existing connections (skips already-set-up ones)
+            this.setupEncryptionTransforms();
+
+            // Enable — transforms start encrypting instead of pass-through
             this.frameCryptor.enable();
 
             this.showToast('🔒 Шифрование включено');
         } else {
-            // Disable encryption (transforms stay as pass-through)
+            // Disable — transforms become pass-through, but stay in place
             this.frameCryptor.disable();
 
-            // Notify all participants to disable encryption
+            // Notify all participants
             this.broadcastEncryptionDisabled();
 
             this.showToast('🔓 Шифрование выключено');
@@ -1235,7 +1260,10 @@ class CallingApp {
             const keyData = new Uint8Array(message.keyData);
             await this.frameCryptor.setKey(keyData);
 
-            // Enable encryption (transforms already in place as pass-through)
+            // Set up transforms (skips already-set-up ones)
+            this.setupEncryptionTransforms();
+
+            // Enable — transforms start encrypting
             this.frameCryptor.enable();
 
             this.updateEncryptionUI(true);
