@@ -543,9 +543,10 @@ class CallingApp {
         video.srcObject = stream;
         video.autoplay = true;
         video.playsinline = true;
-        if (isLocal) {
-            video.muted = true;
-        }
+        // Mute all videos initially — local stays muted, remote audio is
+        // routed through Web Audio API in setupVolumeControl().
+        // This also ensures autoplay works on iOS Safari.
+        video.muted = true;
 
         const label = document.createElement('div');
         label.className = 'video-label';
@@ -965,10 +966,20 @@ class CallingApp {
         });
     }
 
+    supportsInsertableStreams() {
+        return typeof RTCRtpSender !== 'undefined' &&
+            typeof RTCRtpSender.prototype.createEncodedStreams === 'function';
+    }
+
     async toggleEncryption() {
         const enabling = !this.frameCryptor.encryptionEnabled;
 
         if (enabling) {
+            if (!this.supportsInsertableStreams()) {
+                this.showToast('Шифрование не поддерживается в этом браузере');
+                return;
+            }
+
             // Enable encryption
             this.frameCryptor.enable();
 
@@ -1176,13 +1187,19 @@ class CallingApp {
         }, 3000);
     }
 
-    playReactionSound() {
-        // Initialize audio context if needed
+    ensureAudioContext() {
         if (!this.audioContext) {
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
         }
+        // iOS Safari suspends AudioContext until resumed from a user gesture
+        if (this.audioContext.state === 'suspended') {
+            this.audioContext.resume();
+        }
+        return this.audioContext;
+    }
 
-        const ctx = this.audioContext;
+    playReactionSound() {
+        const ctx = this.ensureAudioContext();
         const oscillator = ctx.createOscillator();
         const gainNode = ctx.createGain();
 
@@ -1223,12 +1240,7 @@ class CallingApp {
 
     setupVolumeControl(clientId, videoElement, stream) {
         try {
-            // Create audio context if needed
-            if (!this.audioContext) {
-                this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            }
-
-            const audioContext = this.audioContext;
+            const audioContext = this.ensureAudioContext();
 
             // Mute the video element (we'll route audio through Web Audio API)
             videoElement.muted = true;
