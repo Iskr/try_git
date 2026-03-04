@@ -850,9 +850,9 @@ class CallingApp {
 
     createPeerConnection(remoteClientId) {
         const pcConfig = { ...config };
-        // Chrome requires encodedInsertableStreams for createEncodedStreams API
-        // Always enable so we can set up transforms later when encryption is toggled
-        if (this.frameCryptor.useLegacyStreams) {
+        // Only enable encodedInsertableStreams when encryption is active
+        // (setting this flag without piping the streams causes frame loss)
+        if (this.frameCryptor.useLegacyStreams && this.frameCryptor.encryptionEnabled) {
             pcConfig.encodedInsertableStreams = true;
         }
         const pc = new RTCPeerConnection(pcConfig);
@@ -862,7 +862,7 @@ class CallingApp {
         this.localStream.getTracks().forEach(track => {
             const sender = pc.addTrack(track, this.localStream);
 
-            // Set up encryption transform only if encryption is already active
+            // Set up encryption transform if encryption is active
             if (this.frameCryptor.encryptionEnabled) {
                 this.frameCryptor.setupSenderTransform(sender, track.id);
             }
@@ -1194,16 +1194,36 @@ class CallingApp {
     }
 
     setupEncryptionTransforms() {
-        this.peerConnections.forEach((pc) => {
-            pc.getSenders().forEach(sender => {
-                if (sender.track) {
-                    this.frameCryptor.setupSenderTransform(sender, sender.track.id);
-                }
+        if (this.frameCryptor.useScriptTransform) {
+            // RTCRtpScriptTransform can be assigned to existing senders/receivers
+            this.peerConnections.forEach((pc) => {
+                pc.getSenders().forEach(sender => {
+                    if (sender.track) {
+                        this.frameCryptor.setupSenderTransform(sender, sender.track.id);
+                    }
+                });
+                pc.getReceivers().forEach(receiver => {
+                    this.frameCryptor.setupReceiverTransform(receiver);
+                });
             });
-            pc.getReceivers().forEach(receiver => {
-                this.frameCryptor.setupReceiverTransform(receiver);
-            });
-        });
+        } else if (this.frameCryptor.useLegacyStreams) {
+            // Legacy API needs encodedInsertableStreams at PeerConnection creation
+            // Recreate all connections with the flag enabled
+            this._recreateAllPeerConnections();
+        }
+    }
+
+    async _recreateAllPeerConnections() {
+        const peerIds = Array.from(this.peerConnections.keys());
+        for (const peerId of peerIds) {
+            const oldPc = this.peerConnections.get(peerId);
+            if (oldPc) {
+                oldPc.close();
+                this.peerConnections.delete(peerId);
+            }
+            this.pendingIceCandidates.delete(peerId);
+            await this.createOffer(peerId);
+        }
     }
 
     async toggleEncryption() {
@@ -1215,23 +1235,26 @@ class CallingApp {
                 return;
             }
 
-            // Generate key and share it
+            // Generate key, enable flag first (so createPeerConnection sees it)
             const keyData = await this.frameCryptor.exportKey();
+            this.frameCryptor.enable();
+
+            // Share key with peers
             await this.broadcastEncryptionKey(keyData);
 
-            // Set up transforms for existing connections (skips already-set-up ones)
+            // Set up transforms for existing connections
             this.setupEncryptionTransforms();
-
-            // Enable — transforms start encrypting instead of pass-through
-            this.frameCryptor.enable();
 
             this.showToast('🔒 Шифрование включено');
         } else {
-            // Disable — transforms become pass-through, but stay in place
             this.frameCryptor.disable();
-
-            // Notify all participants
             this.broadcastEncryptionDisabled();
+
+            // For legacy API, recreate connections without encodedInsertableStreams
+            if (this.frameCryptor.useLegacyStreams) {
+                this.frameCryptor.clearTransforms();
+                this._recreateAllPeerConnections();
+            }
 
             this.showToast('🔓 Шифрование выключено');
         }
@@ -1278,6 +1301,13 @@ class CallingApp {
     handleEncryptionDisabled(message) {
         try {
             this.frameCryptor.disable();
+
+            // For legacy API, recreate connections without encodedInsertableStreams
+            if (this.frameCryptor.useLegacyStreams) {
+                this.frameCryptor.clearTransforms();
+                this._recreateAllPeerConnections();
+            }
+
             this.updateEncryptionUI(false);
             console.log('Encryption disabled by:', message.senderId);
             this.showToast('🔓 Шифрование выключено');
