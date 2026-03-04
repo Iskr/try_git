@@ -48,6 +48,19 @@ const config = {
 
 const MAX_PARTICIPANTS = 5;
 
+const MEDIA_CONSTRAINTS = {
+    video: {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        facingMode: 'user'
+    },
+    audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+    }
+};
+
 // Frame Encryption using Web Crypto API and Insertable Streams
 class FrameCryptor {
     constructor() {
@@ -248,7 +261,6 @@ class CallingApp {
         this.layoutMode = localStorage.getItem('layoutMode') || 'auto'; // grid, spotlight, sidebar, auto
 
         this.frameCryptor = new FrameCryptor();
-        this.isEncryptionEnabled = false;
 
         // Reactions system
         this.reactions = ['❤️', '👍', '😂', '😮', '😢', '🔥', '🎉', '👏', '💯', '🚀'];
@@ -410,7 +422,7 @@ class CallingApp {
                     this.updateConnectionStatus(`${this.participants.size} участников`);
 
                     // If encryption is enabled, share key with new participant
-                    if (this.isEncryptionEnabled) {
+                    if (this.frameCryptor.encryptionEnabled) {
                         const keyData = await this.frameCryptor.exportKey();
                         const keyArray = Array.from(keyData);
                         this.ws.send(JSON.stringify({
@@ -489,18 +501,7 @@ class CallingApp {
     async startCall() {
         try {
             // Get user media
-            this.localStream = await navigator.mediaDevices.getUserMedia({
-                video: {
-                    width: { ideal: 1280 },
-                    height: { ideal: 720 },
-                    facingMode: 'user'
-                },
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
-                }
-            });
+            this.localStream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
 
             // Add local video to grid
             this.addVideoStream(this.clientId, this.localStream, true);
@@ -684,7 +685,7 @@ class CallingApp {
             const sender = pc.addTrack(track, this.localStream);
 
             // Setup encryption transform for sender
-            if (this.isEncryptionEnabled) {
+            if (this.frameCryptor.encryptionEnabled) {
                 this.frameCryptor.setupSenderTransform(sender, track.id);
             }
         });
@@ -696,7 +697,7 @@ class CallingApp {
             this.updateConnectionStatus(`${this.participants.size} участников`);
 
             // Setup encryption transform for receiver
-            if (this.isEncryptionEnabled && event.receiver) {
+            if (this.frameCryptor.encryptionEnabled && event.receiver) {
                 this.frameCryptor.setupReceiverTransform(event.receiver);
             }
         };
@@ -771,18 +772,7 @@ class CallingApp {
         // Ensure we have local stream before creating peer connection
         if (!this.localStream) {
             try {
-                this.localStream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 },
-                        facingMode: 'user'
-                    },
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    }
-                });
+                this.localStream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
                 this.addVideoStream(this.clientId, this.localStream, true);
             } catch (error) {
                 console.error('Error accessing media devices:', error);
@@ -950,20 +940,35 @@ class CallingApp {
         }
     }
 
-    async toggleEncryption() {
-        this.isEncryptionEnabled = !this.isEncryptionEnabled;
-
+    updateEncryptionUI(enabled) {
         const btn = document.getElementById('toggle-encryption-btn');
         const encryptionOn = btn.querySelector('.encryption-on');
         const encryptionOff = btn.querySelector('.encryption-off');
         const indicator = document.getElementById('encryption-indicator');
 
-        btn.classList.toggle('active', this.isEncryptionEnabled);
-        encryptionOn.classList.toggle('hidden', !this.isEncryptionEnabled);
-        encryptionOff.classList.toggle('hidden', this.isEncryptionEnabled);
-        indicator.classList.toggle('hidden', !this.isEncryptionEnabled);
+        btn.classList.toggle('active', enabled);
+        encryptionOn.classList.toggle('hidden', !enabled);
+        encryptionOff.classList.toggle('hidden', enabled);
+        indicator.classList.toggle('hidden', !enabled);
+    }
 
-        if (this.isEncryptionEnabled) {
+    setupEncryptionTransforms() {
+        this.peerConnections.forEach((pc) => {
+            pc.getSenders().forEach(sender => {
+                if (sender.track) {
+                    this.frameCryptor.setupSenderTransform(sender, sender.track.id);
+                }
+            });
+            pc.getReceivers().forEach(receiver => {
+                this.frameCryptor.setupReceiverTransform(receiver);
+            });
+        });
+    }
+
+    async toggleEncryption() {
+        const enabling = !this.frameCryptor.encryptionEnabled;
+
+        if (enabling) {
             // Enable encryption
             this.frameCryptor.enable();
 
@@ -972,19 +977,7 @@ class CallingApp {
             await this.broadcastEncryptionKey(keyData);
 
             // Setup transforms for all existing connections
-            this.peerConnections.forEach((pc, clientId) => {
-                const senders = pc.getSenders();
-                senders.forEach(sender => {
-                    if (sender.track) {
-                        this.frameCryptor.setupSenderTransform(sender, sender.track.id);
-                    }
-                });
-
-                const receivers = pc.getReceivers();
-                receivers.forEach(receiver => {
-                    this.frameCryptor.setupReceiverTransform(receiver);
-                });
-            });
+            this.setupEncryptionTransforms();
 
             this.showToast('🔒 Шифрование включено');
         } else {
@@ -997,34 +990,24 @@ class CallingApp {
 
             this.showToast('🔓 Шифрование выключено');
         }
+
+        this.updateEncryptionUI(enabling);
+    }
+
+    broadcastToParticipants(message) {
+        this.participants.forEach((_, clientId) => {
+            if (clientId !== this.clientId) {
+                this.ws.send(JSON.stringify({ ...message, targetId: clientId }));
+            }
+        });
     }
 
     async broadcastEncryptionKey(keyData) {
-        // Send encryption key to all participants
-        const keyArray = Array.from(keyData);
-
-        this.participants.forEach((participant, clientId) => {
-            if (clientId !== this.clientId) {
-                this.ws.send(JSON.stringify({
-                    type: 'encryption-key',
-                    keyData: keyArray,
-                    targetId: clientId
-                }));
-            }
-        });
+        this.broadcastToParticipants({ type: 'encryption-key', keyData: Array.from(keyData) });
     }
 
     broadcastEncryptionDisabled() {
-        // Notify all participants that encryption is disabled
-        this.participants.forEach((participant, clientId) => {
-            if (clientId !== this.clientId) {
-                this.ws.send(JSON.stringify({
-                    type: 'encryption-disabled',
-                    targetId: clientId
-                }));
-            }
-        });
-        console.log('Broadcast encryption disabled to all participants');
+        this.broadcastToParticipants({ type: 'encryption-disabled' });
     }
 
     async handleEncryptionKey(message) {
@@ -1034,33 +1017,12 @@ class CallingApp {
 
             // Enable encryption
             this.frameCryptor.enable();
-            this.isEncryptionEnabled = true;
 
             // Update UI
-            const btn = document.getElementById('toggle-encryption-btn');
-            const encryptionOn = btn.querySelector('.encryption-on');
-            const encryptionOff = btn.querySelector('.encryption-off');
-            const indicator = document.getElementById('encryption-indicator');
-
-            btn.classList.add('active');
-            encryptionOn.classList.remove('hidden');
-            encryptionOff.classList.add('hidden');
-            indicator.classList.remove('hidden');
+            this.updateEncryptionUI(true);
 
             // Setup transforms for all existing connections
-            this.peerConnections.forEach((pc, clientId) => {
-                const senders = pc.getSenders();
-                senders.forEach(sender => {
-                    if (sender.track) {
-                        this.frameCryptor.setupSenderTransform(sender, sender.track.id);
-                    }
-                });
-
-                const receivers = pc.getReceivers();
-                receivers.forEach(receiver => {
-                    this.frameCryptor.setupReceiverTransform(receiver);
-                });
-            });
+            this.setupEncryptionTransforms();
 
             console.log('Encryption key received from:', message.senderId);
             this.showToast('🔒 Шифрование включено');
@@ -1075,18 +1037,9 @@ class CallingApp {
             // Disable encryption
             this.frameCryptor.disable();
             this.frameCryptor.clearTransforms();
-            this.isEncryptionEnabled = false;
 
             // Update UI
-            const btn = document.getElementById('toggle-encryption-btn');
-            const encryptionOn = btn.querySelector('.encryption-on');
-            const encryptionOff = btn.querySelector('.encryption-off');
-            const indicator = document.getElementById('encryption-indicator');
-
-            btn.classList.remove('active');
-            encryptionOn.classList.add('hidden');
-            encryptionOff.classList.remove('hidden');
-            indicator.classList.add('hidden');
+            this.updateEncryptionUI(false);
 
             console.log('Encryption disabled by:', message.senderId);
             this.showToast('🔓 Шифрование выключено');
@@ -1183,15 +1136,7 @@ class CallingApp {
         this.playReactionSound();
 
         // Send to all participants
-        this.participants.forEach((participant, clientId) => {
-            if (clientId !== this.clientId) {
-                this.ws.send(JSON.stringify({
-                    type: 'reaction',
-                    emoji: emoji,
-                    targetId: clientId
-                }));
-            }
-        });
+        this.broadcastToParticipants({ type: 'reaction', emoji });
 
         console.log('Sent reaction:', emoji);
     }
@@ -1270,7 +1215,10 @@ class CallingApp {
     }
 
     saveVolumeSettings() {
-        localStorage.setItem('volumeSettings', JSON.stringify(this.volumeSettings));
+        clearTimeout(this._saveVolumeTimer);
+        this._saveVolumeTimer = setTimeout(() => {
+            localStorage.setItem('volumeSettings', JSON.stringify(this.volumeSettings));
+        }, 300);
     }
 
     setupVolumeControl(clientId, videoElement, stream) {
@@ -1424,7 +1372,6 @@ class CallingApp {
         }
 
         // Reset encryption
-        this.isEncryptionEnabled = false;
         this.frameCryptor.disable();
         this.frameCryptor.clearTransforms();
 
@@ -1508,7 +1455,8 @@ class CallingApp {
         toast.textContent = message;
         toast.classList.add('show');
 
-        setTimeout(() => {
+        clearTimeout(this._toastTimer);
+        this._toastTimer = setTimeout(() => {
             toast.classList.remove('show');
         }, 3000);
     }
