@@ -309,6 +309,16 @@ class CallingApp {
 
         this.frameCryptor = new FrameCryptor();
 
+        // Connection resilience
+        this._wsReconnectAttempt = 0;
+        this._wsReconnectTimer = null;
+        this._wsMaxReconnectAttempts = 10;
+        this._heartbeatTimer = null;
+        this._heartbeatTimeout = null;
+        this._iceRestartAttempts = new Map(); // Map<clientId, attemptCount>
+        this._iceRestartTimers = new Map();
+        this._maxIceRestarts = 4;
+
         // Reactions system
         this.reactions = ['❤️', '👍', '😂', '😮', '😢', '🔥', '🎉', '👏', '💯', '🚀'];
         this.reactionCounts = this.loadReactionCounts();
@@ -425,24 +435,99 @@ class CallingApp {
 
         this.ws.onopen = () => {
             console.log('WebSocket connected');
+            this._wsReconnectAttempt = 0;
+
+            // If we were in a call, rejoin the room
+            if (this.roomId && this.clientId) {
+                console.log('Rejoining room after reconnect...');
+                this.ws.send(JSON.stringify({
+                    type: 'rejoin',
+                    roomId: this.roomId,
+                    clientId: this.clientId
+                }));
+                this.showToast('Соединение восстановлено');
+            }
+
+            this._startHeartbeat();
         };
 
         this.ws.onmessage = (event) => {
             const message = JSON.parse(event.data);
+            if (message.type === 'pong') {
+                // Heartbeat response received
+                clearTimeout(this._heartbeatTimeout);
+                return;
+            }
             this.handleSignalingMessage(message);
         };
 
         this.ws.onerror = (error) => {
             console.error('WebSocket error:', error);
-            this.showToast('Ошибка подключения к серверу');
         };
 
         this.ws.onclose = () => {
             console.log('WebSocket disconnected');
+            this._stopHeartbeat();
+
             if (this.roomId) {
-                this.showToast('Соединение потеряно');
+                this.updateConnectionStatus('Переподключение...');
+                this._scheduleReconnect();
             }
         };
+    }
+
+    _startHeartbeat() {
+        this._stopHeartbeat();
+        this._heartbeatTimer = setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify({ type: 'ping' }));
+
+                // If no pong received within 5 seconds, connection is dead
+                this._heartbeatTimeout = setTimeout(() => {
+                    console.warn('Heartbeat timeout — closing WebSocket');
+                    if (this.ws) this.ws.close();
+                }, 5000);
+            }
+        }, 15000);
+    }
+
+    _stopHeartbeat() {
+        clearInterval(this._heartbeatTimer);
+        clearTimeout(this._heartbeatTimeout);
+        this._heartbeatTimer = null;
+        this._heartbeatTimeout = null;
+    }
+
+    _scheduleReconnect() {
+        if (this._wsReconnectAttempt >= this._wsMaxReconnectAttempts) {
+            this.showToast('Не удалось восстановить соединение');
+            this.updateConnectionStatus('Отключено');
+            return;
+        }
+
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+        const delay = Math.min(1000 * Math.pow(2, this._wsReconnectAttempt), 30000);
+        this._wsReconnectAttempt++;
+
+        console.log(`WebSocket reconnect attempt ${this._wsReconnectAttempt} in ${delay}ms`);
+        this._wsReconnectTimer = setTimeout(() => {
+            this.connectWebSocket();
+        }, delay);
+    }
+
+    _cancelReconnect() {
+        clearTimeout(this._wsReconnectTimer);
+        this._wsReconnectTimer = null;
+        this._wsReconnectAttempt = 0;
+    }
+
+    _sendWs(data) {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify(data));
+            return true;
+        }
+        console.warn('WebSocket not connected, message dropped:', data.type);
+        return false;
     }
 
     async handleSignalingMessage(message) {
@@ -472,11 +557,11 @@ class CallingApp {
                     if (this.frameCryptor.encryptionEnabled) {
                         const keyData = await this.frameCryptor.exportKey();
                         const keyArray = Array.from(keyData);
-                        this.ws.send(JSON.stringify({
+                        this._sendWs({
                             type: 'encryption-key',
                             keyData: keyArray,
                             targetId: message.clientId
-                        }));
+                        });
                         console.log('Sent encryption key to new participant:', message.clientId);
                     }
 
@@ -539,10 +624,10 @@ class CallingApp {
     }
 
     joinRoom(roomId) {
-        this.ws.send(JSON.stringify({
+        this._sendWs({
             type: 'join',
             roomId: roomId
-        }));
+        });
     }
 
     async startCall() {
@@ -791,11 +876,11 @@ class CallingApp {
         pc.onicecandidate = (event) => {
             if (event.candidate) {
                 console.log('Sending ICE candidate to:', remoteClientId, event.candidate.type);
-                this.ws.send(JSON.stringify({
+                this._sendWs({
                     type: 'ice-candidate',
                     candidate: event.candidate,
                     targetId: remoteClientId
-                }));
+                });
             } else {
                 console.log('All ICE candidates sent to:', remoteClientId);
             }
@@ -808,14 +893,26 @@ class CallingApp {
             switch (pc.iceConnectionState) {
                 case 'connected':
                 case 'completed':
+                    // Reset ICE restart counter on success
+                    this._iceRestartAttempts.delete(remoteClientId);
+                    this._clearIceRestartTimer(remoteClientId);
                     this.updateConnectionStatus(`${this.participants.size} участников`, true);
                     break;
                 case 'failed':
                     console.error('ICE connection failed for:', remoteClientId);
-                    this.restartIce(remoteClientId);
+                    this._attemptIceRestart(remoteClientId);
                     break;
                 case 'disconnected':
                     this.updateConnectionStatus('Переподключение...');
+                    // Start a timer — if not recovered in 5s, try ICE restart
+                    this._clearIceRestartTimer(remoteClientId);
+                    this._iceRestartTimers.set(remoteClientId, setTimeout(() => {
+                        const currentPc = this.peerConnections.get(remoteClientId);
+                        if (currentPc && currentPc.iceConnectionState === 'disconnected') {
+                            console.log(`Peer ${remoteClientId} still disconnected, attempting ICE restart`);
+                            this._attemptIceRestart(remoteClientId);
+                        }
+                    }, 5000));
                     break;
             }
         };
@@ -824,7 +921,8 @@ class CallingApp {
         pc.onconnectionstatechange = () => {
             console.log(`Connection state (${remoteClientId}):`, pc.connectionState);
             if (pc.connectionState === 'failed') {
-                this.showToast('Не удалось подключиться к участнику');
+                // Full reconnect — close old connection and create new one
+                this._reconnectPeer(remoteClientId);
             }
         };
 
@@ -843,11 +941,11 @@ class CallingApp {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
 
-            this.ws.send(JSON.stringify({
+            this._sendWs({
                 type: 'offer',
                 offer: offer,
                 targetId: remoteClientId
-            }));
+            });
         } catch (error) {
             console.error('Error creating offer:', error);
         }
@@ -877,11 +975,11 @@ class CallingApp {
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
 
-            this.ws.send(JSON.stringify({
+            this._sendWs({
                 type: 'answer',
                 answer: answer,
                 targetId: message.senderId
-            }));
+            });
         } catch (error) {
             console.error('Error handling offer:', error);
         }
@@ -942,28 +1040,78 @@ class CallingApp {
         }
     }
 
-    async restartIce(clientId) {
-        const pc = this.peerConnections.get(clientId);
-        if (!pc) return;
+    _clearIceRestartTimer(clientId) {
+        const timer = this._iceRestartTimers.get(clientId);
+        if (timer) {
+            clearTimeout(timer);
+            this._iceRestartTimers.delete(clientId);
+        }
+    }
 
-        console.log(`Attempting ICE restart for ${clientId}...`);
+    _attemptIceRestart(clientId) {
+        const attempt = (this._iceRestartAttempts.get(clientId) || 0) + 1;
+        this._iceRestartAttempts.set(clientId, attempt);
 
+        if (attempt > this._maxIceRestarts) {
+            console.log(`Max ICE restarts reached for ${clientId}, doing full reconnect`);
+            this._reconnectPeer(clientId);
+            return;
+        }
+
+        // Exponential backoff: 1s, 2s, 4s, 8s
+        const delay = 1000 * Math.pow(2, attempt - 1);
+        console.log(`ICE restart attempt ${attempt}/${this._maxIceRestarts} for ${clientId} in ${delay}ms`);
+
+        this._clearIceRestartTimer(clientId);
+        this._iceRestartTimers.set(clientId, setTimeout(async () => {
+            const pc = this.peerConnections.get(clientId);
+            if (!pc) return;
+
+            try {
+                const offer = await pc.createOffer({ iceRestart: true });
+                await pc.setLocalDescription(offer);
+                this._sendWs({
+                    type: 'offer',
+                    offer: offer,
+                    targetId: clientId
+                });
+            } catch (error) {
+                console.error('Error during ICE restart:', error);
+            }
+        }, delay));
+    }
+
+    async _reconnectPeer(clientId) {
+        console.log(`Full reconnect for peer ${clientId}`);
+        this.showToast('Переподключение к участнику...');
+
+        // Clean up old connection
+        this._clearIceRestartTimer(clientId);
+        this._iceRestartAttempts.delete(clientId);
+
+        const oldPc = this.peerConnections.get(clientId);
+        if (oldPc) {
+            oldPc.close();
+            this.peerConnections.delete(clientId);
+        }
+
+        this.pendingIceCandidates.delete(clientId);
+
+        // Create new connection and offer
         try {
-            const offer = await pc.createOffer({ iceRestart: true });
-            await pc.setLocalDescription(offer);
-
-            this.ws.send(JSON.stringify({
-                type: 'offer',
-                offer: offer,
-                targetId: clientId
-            }));
+            await this.createOffer(clientId);
         } catch (error) {
-            console.error('Error during ICE restart:', error);
+            console.error('Error reconnecting peer:', error);
+            this.showToast('Не удалось переподключиться');
         }
     }
 
     handlePeerLeft(clientId) {
         console.log('Peer left:', clientId);
+
+        // Clean up reconnection state
+        this._clearIceRestartTimer(clientId);
+        this._iceRestartAttempts.delete(clientId);
 
         // Close peer connection
         const pc = this.peerConnections.get(clientId);
@@ -1087,7 +1235,7 @@ class CallingApp {
     broadcastToParticipants(message) {
         this.participants.forEach((_, clientId) => {
             if (clientId !== this.clientId) {
-                this.ws.send(JSON.stringify({ ...message, targetId: clientId }));
+                this._sendWs({ ...message, targetId: clientId });
             }
         });
     }
@@ -1437,6 +1585,11 @@ class CallingApp {
             this.localStream = null;
         }
 
+        // Clean up ICE restart timers
+        this._iceRestartTimers.forEach(timer => clearTimeout(timer));
+        this._iceRestartTimers.clear();
+        this._iceRestartAttempts.clear();
+
         // Close all peer connections
         this.peerConnections.forEach((pc, clientId) => {
             pc.close();
@@ -1455,12 +1608,11 @@ class CallingApp {
         this.audioContexts.clear();
 
         // Notify server
-        if (this.ws && this.roomId) {
-            this.ws.send(JSON.stringify({
-                type: 'leave',
-                roomId: this.roomId
-            }));
-        }
+        this._sendWs({ type: 'leave', roomId: this.roomId });
+
+        // Cancel any pending reconnection
+        this._cancelReconnect();
+        this._stopHeartbeat();
 
         // Reset encryption
         this.frameCryptor.disable();
