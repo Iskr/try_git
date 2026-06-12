@@ -1,77 +1,21 @@
-// Encryption Worker for RTCRtpScriptTransform (Safari/Firefox)
-// Uses AES-GCM 128-bit encryption
+// E2EE worker for RTCRtpScriptTransform (Chrome 128+, Firefox, Safari).
+// Each frame is encrypted with AES-256-GCM under a fresh random 12-byte IV.
+// Encrypted frames carry a 3-byte marker so the receiver can tell them apart
+// from plaintext frames during enable/disable transitions:
+//   [0xE2 0xEE 0x01][IV (12 bytes)][AES-GCM ciphertext]
+const MAGIC = new Uint8Array([0xe2, 0xee, 0x01]);
+const IV_LENGTH = 12;
+const HEADER_LENGTH = MAGIC.length + IV_LENGTH;
 
 let encryptionKey = null;
 let encryptionEnabled = false;
-const frameCounters = new Map();
 
-function getIV(trackId, counter) {
-    const iv = new Uint8Array(12);
-    const hash = trackId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-    const view = new DataView(iv.buffer);
-    view.setUint32(0, hash);
-    view.setUint32(4, hash >> 8);
-    view.setUint32(8, counter);
-    return iv;
-}
-
-async function encryptFrame(encodedFrame, controller, trackId) {
-    if (!encryptionEnabled || !encryptionKey) {
-        controller.enqueue(encodedFrame);
-        return;
-    }
-    try {
-        const data = new Uint8Array(encodedFrame.data);
-        if (!frameCounters.has(trackId)) {
-            frameCounters.set(trackId, 0);
-        }
-        const counter = frameCounters.get(trackId);
-        frameCounters.set(trackId, counter + 1);
-        const iv = getIV(trackId, counter);
-        const encrypted = await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv },
-            encryptionKey,
-            data
-        );
-        const newData = new Uint8Array(12 + encrypted.byteLength);
-        newData.set(iv, 0);
-        newData.set(new Uint8Array(encrypted), 12);
-        encodedFrame.data = newData.buffer;
-        controller.enqueue(encodedFrame);
-    } catch (e) {
-        controller.enqueue(encodedFrame);
-    }
-}
-
-async function decryptFrame(encodedFrame, controller) {
-    if (!encryptionEnabled || !encryptionKey) {
-        controller.enqueue(encodedFrame);
-        return;
-    }
-    try {
-        const data = new Uint8Array(encodedFrame.data);
-        const iv = data.slice(0, 12);
-        const encryptedData = data.slice(12);
-        const decrypted = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv },
-            encryptionKey,
-            encryptedData
-        );
-        encodedFrame.data = decrypted;
-        controller.enqueue(encodedFrame);
-    } catch (e) {
-        // Skip frame on decryption failure
-    }
-}
-
-// Receive key/enable/disable commands via worker.postMessage()
-self.onmessage = async (event) => {
-    const msg = event.data;
-    if (msg.type === 'setKey') {
+async function handleControl(msg) {
+    if (msg.type === 'setKey' && Array.isArray(msg.keyData) && msg.keyData.length === 32) {
         encryptionKey = await crypto.subtle.importKey(
             'raw',
             new Uint8Array(msg.keyData),
-            { name: 'AES-GCM', length: 128 },
+            { name: 'AES-GCM' },
             false,
             ['encrypt', 'decrypt']
         );
@@ -79,24 +23,82 @@ self.onmessage = async (event) => {
         encryptionEnabled = true;
     } else if (msg.type === 'disable') {
         encryptionEnabled = false;
+    } else if (msg.type === 'clearKey') {
+        encryptionKey = null;
+        encryptionEnabled = false;
     }
+}
+
+// Commands are serialized so 'enable' can never overtake a pending async
+// 'setKey' import and flip the flag before the key is ready.
+let controlQueue = Promise.resolve();
+self.onmessage = (event) => {
+    const msg = event.data || {};
+    controlQueue = controlQueue.then(() => handleControl(msg)).catch(() => {});
 };
 
-// Handle RTCRtpScriptTransform — pipe frames through encrypt/decrypt
+function isEncryptedFrame(data) {
+    return data.length > HEADER_LENGTH
+        && data[0] === MAGIC[0]
+        && data[1] === MAGIC[1]
+        && data[2] === MAGIC[2];
+}
+
+async function encryptFrame(frame, controller) {
+    if (!encryptionEnabled) {
+        controller.enqueue(frame);
+        return;
+    }
+    if (!encryptionKey) {
+        // Enabled but the key is not ready — fail closed.
+        return;
+    }
+    try {
+        const data = new Uint8Array(frame.data);
+        const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+        const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, encryptionKey, data);
+        const out = new Uint8Array(HEADER_LENGTH + encrypted.byteLength);
+        out.set(MAGIC, 0);
+        out.set(iv, MAGIC.length);
+        out.set(new Uint8Array(encrypted), HEADER_LENGTH);
+        frame.data = out.buffer;
+        controller.enqueue(frame);
+    } catch (e) {
+        // Fail closed: a frame that could not be encrypted must never leave
+        // in plaintext, so it is dropped.
+    }
+}
+
+async function decryptFrame(frame, controller) {
+    const data = new Uint8Array(frame.data);
+    if (!isEncryptedFrame(data)) {
+        // Plaintext frame. Render it only while encryption is off — once the
+        // user sees the lock indicator, unencrypted media must not slip
+        // through (fail closed on receive as well as send).
+        if (encryptionEnabled) return;
+        controller.enqueue(frame);
+        return;
+    }
+    if (!encryptionKey) {
+        // Encrypted frame but no key yet — drop until the key arrives.
+        return;
+    }
+    try {
+        const iv = data.slice(MAGIC.length, HEADER_LENGTH);
+        const payload = data.slice(HEADER_LENGTH);
+        const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, encryptionKey, payload);
+        frame.data = decrypted;
+        controller.enqueue(frame);
+    } catch (e) {
+        // Drop frames that fail authentication.
+    }
+}
+
 self.onrtctransform = (event) => {
-    const { name, trackId } = event.transformer.options;
-
+    const side = event.transformer.options && event.transformer.options.side;
     const transform = new TransformStream({
-        async transform(encodedFrame, controller) {
-            if (name === 'sender') {
-                await encryptFrame(encodedFrame, controller, trackId || 'unknown');
-            } else {
-                await decryptFrame(encodedFrame, controller);
-            }
-        }
+        transform: (frame, controller) =>
+            side === 'sender' ? encryptFrame(frame, controller) : decryptFrame(frame, controller),
     });
-
-    event.transformer.readable
-        .pipeThrough(transform)
-        .pipeTo(event.transformer.writable);
+    event.transformer.readable.pipeThrough(transform).pipeTo(event.transformer.writable);
 };
