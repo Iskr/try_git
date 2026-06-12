@@ -979,6 +979,7 @@ h1 {
     right: 8px;
     width: 32px;
     height: 32px;
+    padding: 0;
     border-radius: 50%;
     background: rgba(0, 0, 0, 0.6);
     -webkit-backdrop-filter: blur(10px);

@@ -1,52 +1,18 @@
-// WebRTC Configuration
-const config = {
+// Fallback WebRTC configuration. The real ICE server list (including TURN
+// credentials) is fetched from /config so secrets stay in server env vars.
+const DEFAULT_RTC_CONFIG = {
     iceServers: [
-        // STUN servers (only 1-2 needed)
-        { urls: 'stun:stun.l.google.com:19302' },
-
-        // Multiple TURN server options for better reliability
-        // Twilio STUN/TURN (fallback)
-        {
-            urls: 'stun:global.stun.twilio.com:3478'
-        },
-
-        // Free TURN server alternative 1
-        {
-            urls: [
-                'turn:numb.viagenie.ca',
-                'turn:numb.viagenie.ca:3478'
-            ],
-            username: 'webrtc@live.com',
-            credential: 'muazkh'
-        },
-
-        // Free TURN server alternative 2
-        {
-            urls: [
-                'turn:turn.anyfirewall.com:443?transport=tcp',
-            ],
-            username: 'webrtc',
-            credential: 'webrtc'
-        },
-
-        // OpenRelay (may be unstable)
-        {
-            urls: [
-                'turn:openrelay.metered.ca:80',
-                'turn:openrelay.metered.ca:443',
-                'turn:openrelay.metered.ca:443?transport=tcp'
-            ],
-            username: 'openrelayproject',
-            credential: 'openrelayproject'
-        }
+        { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }
     ],
     iceCandidatePoolSize: 10,
-    iceTransportPolicy: 'all', // Try all connection types
+    iceTransportPolicy: 'all',
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require'
 };
 
 const MAX_PARTICIPANTS = 5;
+const ROOM_ID_PATTERN = /^[A-Z0-9]{6}$/;
+const MAX_FLYING_REACTIONS = 40;
 
 const MEDIA_CONSTRAINTS = {
     video: {
@@ -61,19 +27,27 @@ const MEDIA_CONSTRAINTS = {
     }
 };
 
-// Frame Encryption using Web Crypto API
-// Supports both Chrome (createEncodedStreams) and Safari/Firefox (RTCRtpScriptTransform)
+// Encrypted frame layout: [0xE2 0xEE 0x01][IV (12 bytes)][AES-GCM ciphertext]
+const E2EE_MAGIC = new Uint8Array([0xe2, 0xee, 0x01]);
+const E2EE_IV_LENGTH = 12;
+const E2EE_HEADER_LENGTH = E2EE_MAGIC.length + E2EE_IV_LENGTH;
+const E2EE_KEY_BYTES = 32;
+
+// Frame encryption (AES-256-GCM, random IV per frame, fail-closed).
+// Prefers the standard RTCRtpScriptTransform (worker-based); falls back to
+// the legacy Chrome createEncodedStreams API. Transforms are installed on
+// every sender/receiver at connection setup and pass frames through
+// untouched until encryption is enabled, so toggling works at any moment
+// without renegotiation.
 class FrameCryptor {
     constructor() {
         this.encryptionKey = null;
-        this.encryptionEnabled = false;
         this.rawKeyData = null;
-        this.senderTransforms = new Map();
-        this.receiverTransforms = new Map();
-        this.frameCounters = new Map();
-        this.workers = []; // Worker instances for RTCRtpScriptTransform
+        this.encryptionEnabled = false;
+        this.worker = null; // single shared worker for all script transforms
+        this.installedSenders = new WeakSet();
+        this.installedReceivers = new WeakSet();
 
-        // Detect which API is available
         this.useScriptTransform = typeof RTCRtpScriptTransform !== 'undefined';
         this.useLegacyStreams = !this.useScriptTransform &&
             typeof RTCRtpSender !== 'undefined' &&
@@ -84,203 +58,151 @@ class FrameCryptor {
         return this.useScriptTransform || this.useLegacyStreams;
     }
 
-    async generateKey() {
-        this.encryptionKey = await crypto.subtle.generateKey(
-            { name: 'AES-GCM', length: 128 },
-            true,
-            ['encrypt', 'decrypt']
-        );
-        this.rawKeyData = new Uint8Array(await crypto.subtle.exportKey('raw', this.encryptionKey));
-        return this.encryptionKey;
+    _getWorker() {
+        if (!this.worker) {
+            this.worker = new Worker('encryption-worker.js');
+            if (this.rawKeyData) {
+                this.worker.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
+            }
+            this.worker.postMessage({ type: this.encryptionEnabled ? 'enable' : 'disable' });
+        }
+        return this.worker;
     }
 
     async setKey(keyData) {
-        this.rawKeyData = new Uint8Array(keyData);
+        const raw = new Uint8Array(keyData);
+        if (raw.length !== E2EE_KEY_BYTES) {
+            throw new Error('Invalid key length');
+        }
+        this.rawKeyData = raw;
         this.encryptionKey = await crypto.subtle.importKey(
             'raw',
-            keyData,
-            { name: 'AES-GCM', length: 128 },
-            true,
+            raw,
+            { name: 'AES-GCM' },
+            false,
             ['encrypt', 'decrypt']
         );
-        this._syncKeyToWorkers();
+        if (this.worker) {
+            this.worker.postMessage({ type: 'setKey', keyData: Array.from(raw) });
+        }
     }
 
-    async exportKey() {
-        if (!this.encryptionKey) {
-            await this.generateKey();
-        }
-        return new Uint8Array(this.rawKeyData);
+    hasSameKey(keyData) {
+        if (!this.rawKeyData || this.rawKeyData.length !== keyData.length) return false;
+        // Not constant-time, but both values belong to the same trust domain.
+        return this.rawKeyData.every((b, i) => b === keyData[i]);
     }
 
     enable() {
         this.encryptionEnabled = true;
-        this.workers.forEach(w => w.postMessage({ type: 'enable' }));
+        if (this.worker) this.worker.postMessage({ type: 'enable' });
     }
 
     disable() {
         this.encryptionEnabled = false;
-        this.workers.forEach(w => w.postMessage({ type: 'disable' }));
+        if (this.worker) this.worker.postMessage({ type: 'disable' });
     }
 
-    _syncKeyToWorkers() {
-        if (!this.rawKeyData) return;
-        const keyArray = Array.from(this.rawKeyData);
-        this.workers.forEach(w => w.postMessage({ type: 'setKey', keyData: keyArray }));
+    reset() {
+        this.disable();
+        this.encryptionKey = null;
+        this.rawKeyData = null;
+        if (this.worker) {
+            this.worker.terminate();
+            this.worker = null;
+        }
+        this.installedSenders = new WeakSet();
+        this.installedReceivers = new WeakSet();
     }
 
-    // --- Legacy API (Chrome): createEncodedStreams ---
+    // --- Legacy Chrome path (main thread) ---
 
-    getIV(trackId, counter) {
-        const iv = new Uint8Array(12);
-        const hash = trackId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-        const view = new DataView(iv.buffer);
-        view.setUint32(0, hash);
-        view.setUint32(4, hash >> 8);
-        view.setUint32(8, counter);
-        return iv;
+    _isEncryptedFrame(data) {
+        return data.length > E2EE_HEADER_LENGTH
+            && data[0] === E2EE_MAGIC[0]
+            && data[1] === E2EE_MAGIC[1]
+            && data[2] === E2EE_MAGIC[2];
     }
 
-    async encryptFrame(encodedFrame, controller, trackId) {
-        if (!this.encryptionEnabled || !this.encryptionKey) {
+    async encryptFrame(encodedFrame, controller) {
+        if (!this.encryptionEnabled) {
             controller.enqueue(encodedFrame);
+            return;
+        }
+        if (!this.encryptionKey) {
+            // Enabled but the key is not ready — fail closed.
             return;
         }
         try {
             const data = new Uint8Array(encodedFrame.data);
-            if (!this.frameCounters.has(trackId)) {
-                this.frameCounters.set(trackId, 0);
-            }
-            const counter = this.frameCounters.get(trackId);
-            this.frameCounters.set(trackId, counter + 1);
-            const iv = this.getIV(trackId, counter);
+            const iv = crypto.getRandomValues(new Uint8Array(E2EE_IV_LENGTH));
             const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.encryptionKey, data);
-            const newData = new Uint8Array(12 + encrypted.byteLength);
-            newData.set(iv, 0);
-            newData.set(new Uint8Array(encrypted), 12);
-            encodedFrame.data = newData.buffer;
+            const out = new Uint8Array(E2EE_HEADER_LENGTH + encrypted.byteLength);
+            out.set(E2EE_MAGIC, 0);
+            out.set(iv, E2EE_MAGIC.length);
+            out.set(new Uint8Array(encrypted), E2EE_HEADER_LENGTH);
+            encodedFrame.data = out.buffer;
             controller.enqueue(encodedFrame);
         } catch (error) {
-            console.error('Encryption error:', error);
-            controller.enqueue(encodedFrame);
+            // Fail closed: never let a plaintext frame leave while encryption
+            // is on — drop it instead.
         }
     }
 
     async decryptFrame(encodedFrame, controller) {
-        if (!this.encryptionEnabled || !this.encryptionKey) {
+        const data = new Uint8Array(encodedFrame.data);
+        if (!this._isEncryptedFrame(data)) {
+            // Plaintext frame. Render it only while encryption is off — once
+            // the user sees the lock indicator, unencrypted media must not
+            // slip through (fail closed on receive as well as send).
+            if (this.encryptionEnabled) return;
             controller.enqueue(encodedFrame);
             return;
         }
+        if (!this.encryptionKey) {
+            return; // encrypted, but no key yet — drop until the key arrives
+        }
         try {
-            const data = new Uint8Array(encodedFrame.data);
-            const iv = data.slice(0, 12);
-            const encryptedData = data.slice(12);
-            const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, this.encryptionKey, encryptedData);
+            const iv = data.slice(E2EE_MAGIC.length, E2EE_HEADER_LENGTH);
+            const payload = data.slice(E2EE_HEADER_LENGTH);
+            const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, this.encryptionKey, payload);
             encodedFrame.data = decrypted;
             controller.enqueue(encodedFrame);
         } catch (error) {
-            // Skip frame if decryption fails
+            // Drop frames that fail authentication.
         }
-    }
-
-    _setupSenderLegacy(sender, trackId) {
-        const streams = sender.createEncodedStreams();
-        const transformStream = new TransformStream({
-            transform: async (encodedFrame, controller) => {
-                await this.encryptFrame(encodedFrame, controller, trackId);
-            }
-        });
-        streams.readable.pipeThrough(transformStream).pipeTo(streams.writable);
-        this.senderTransforms.set(trackId, transformStream);
-    }
-
-    _setupReceiverLegacy(receiver) {
-        const streams = receiver.createEncodedStreams();
-        const transformStream = new TransformStream({
-            transform: async (encodedFrame, controller) => {
-                await this.decryptFrame(encodedFrame, controller);
-            }
-        });
-        streams.readable.pipeThrough(transformStream).pipeTo(streams.writable);
-        const trackId = receiver.track?.id || 'unknown';
-        this.receiverTransforms.set(trackId, transformStream);
-    }
-
-    // --- Standard API (Safari/Firefox): RTCRtpScriptTransform ---
-
-    _setupSenderScriptTransform(sender, trackId) {
-        const worker = new Worker('encryption-worker.js');
-
-        sender.transform = new RTCRtpScriptTransform(
-            worker,
-            { name: 'sender', trackId }
-        );
-
-        this.workers.push(worker);
-
-        // Send current state to new worker
-        if (this.rawKeyData) {
-            worker.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
-        }
-        if (this.encryptionEnabled) {
-            worker.postMessage({ type: 'enable' });
-        }
-
-        this.senderTransforms.set(trackId, { worker });
-    }
-
-    _setupReceiverScriptTransform(receiver) {
-        const trackId = receiver.track?.id || 'unknown';
-        const worker = new Worker('encryption-worker.js');
-
-        receiver.transform = new RTCRtpScriptTransform(
-            worker,
-            { name: 'receiver', trackId }
-        );
-
-        this.workers.push(worker);
-
-        // Send current state to new worker
-        if (this.rawKeyData) {
-            worker.postMessage({ type: 'setKey', keyData: Array.from(this.rawKeyData) });
-        }
-        if (this.encryptionEnabled) {
-            worker.postMessage({ type: 'enable' });
-        }
-
-        this.receiverTransforms.set(trackId, { worker });
     }
 
     // --- Public API ---
 
-    setupSenderTransform(sender, trackId) {
-        // Don't set up twice for the same track (legacy can only be called once)
-        if (this.senderTransforms.has(trackId)) return;
+    setupSenderTransform(sender) {
+        if (!this.supported || this.installedSenders.has(sender)) return;
+        this.installedSenders.add(sender);
 
         if (this.useScriptTransform) {
-            this._setupSenderScriptTransform(sender, trackId);
-        } else if (this.useLegacyStreams) {
-            this._setupSenderLegacy(sender, trackId);
+            sender.transform = new RTCRtpScriptTransform(this._getWorker(), { side: 'sender' });
+        } else {
+            const streams = sender.createEncodedStreams();
+            const transform = new TransformStream({
+                transform: (frame, controller) => this.encryptFrame(frame, controller)
+            });
+            streams.readable.pipeThrough(transform).pipeTo(streams.writable);
         }
     }
 
     setupReceiverTransform(receiver) {
-        const trackId = receiver.track?.id || 'unknown';
-        if (this.receiverTransforms.has(trackId)) return;
+        if (!this.supported || this.installedReceivers.has(receiver)) return;
+        this.installedReceivers.add(receiver);
 
         if (this.useScriptTransform) {
-            this._setupReceiverScriptTransform(receiver);
-        } else if (this.useLegacyStreams) {
-            this._setupReceiverLegacy(receiver);
+            receiver.transform = new RTCRtpScriptTransform(this._getWorker(), { side: 'receiver' });
+        } else {
+            const streams = receiver.createEncodedStreams();
+            const transform = new TransformStream({
+                transform: (frame, controller) => this.decryptFrame(frame, controller)
+            });
+            streams.readable.pipeThrough(transform).pipeTo(streams.writable);
         }
-    }
-
-    clearTransforms() {
-        this.workers.forEach(w => w.terminate());
-        this.workers = [];
-        this.senderTransforms.clear();
-        this.receiverTransforms.clear();
-        this.frameCounters.clear();
     }
 }
 
@@ -288,16 +210,26 @@ class CallingApp {
     constructor() {
         this.ws = null;
         this.peerConnections = new Map(); // Map<clientId, RTCPeerConnection>
+        this.controlChannels = new Map(); // Map<clientId, RTCDataChannel>
         this.localStream = null;
         this.roomId = null;
         this.clientId = null;
+        this.resumeToken = null;
         this.participants = new Map(); // Map<clientId, participantInfo>
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
         this.pendingIceCandidates = new Map(); // Map<clientId, ICECandidate[]>
+        this.pendingJoinRoomId = null;
+        this._lastRequestedRoom = null;
+        this._joining = false;
+        // clientId of the participant whose E2EE key the room converged on
+        this.keyOwner = null;
+
+        this.rtcConfig = DEFAULT_RTC_CONFIG;
+        this.maxParticipants = MAX_PARTICIPANTS;
 
         this.videosContainer = null;
-        this.layoutMode = localStorage.getItem('layoutMode') || 'auto'; // grid, spotlight, sidebar, auto
+        this.layoutMode = localStorage.getItem('layoutMode') || 'auto'; // grid, spotlight, sidebar, compact, auto
 
         this.frameCryptor = new FrameCryptor();
 
@@ -316,13 +248,33 @@ class CallingApp {
         this.reactionCounts = this.loadReactionCounts();
         this.audioContext = null;
 
-        // Volume control system
+        // Volume control system. Settings are per-call only: client ids are
+        // ephemeral, so persisting them would just accumulate garbage.
         this.audioContexts = new Map(); // Map<clientId, {context, gainNode, source}>
-        this.volumeSettings = this.loadVolumeSettings();
+        this.volumeSettings = {};
         this.currentVolumeTarget = null;
+        try { localStorage.removeItem('volumeSettings'); } catch (e) { /* ignore */ }
 
         this.initUI();
+        this.loadIceConfig();
         this.connectWebSocket();
+    }
+
+    async loadIceConfig() {
+        try {
+            const res = await fetch('/config');
+            if (!res.ok) return;
+            const cfg = await res.json();
+            if (Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0) {
+                this.rtcConfig = { ...this.rtcConfig, iceServers: cfg.iceServers };
+            }
+            if (Number.isInteger(cfg.maxParticipants) && cfg.maxParticipants > 1) {
+                // The grid CSS supports at most 6 tiles
+                this.maxParticipants = Math.min(cfg.maxParticipants, 6);
+            }
+        } catch (error) {
+            console.warn('Failed to load ICE config, using defaults:', error);
+        }
     }
 
     initUI() {
@@ -334,6 +286,9 @@ class CallingApp {
         document.getElementById('create-call-btn').addEventListener('click', () => this.createCall());
         document.getElementById('join-call-btn').addEventListener('click', () => this.toggleJoinInput());
         document.getElementById('join-submit-btn').addEventListener('click', () => this.joinCall());
+        document.getElementById('room-id-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') this.joinCall();
+        });
 
         // Call screen controls
         document.getElementById('toggle-audio-btn').addEventListener('click', () => this.toggleAudio());
@@ -343,6 +298,12 @@ class CallingApp {
         document.getElementById('end-call-btn').addEventListener('click', () => this.endCall());
         document.getElementById('copy-link-btn').addEventListener('click', () => this.copyLink());
         document.getElementById('share-telegram-btn').addEventListener('click', () => this.shareTelegram());
+
+        if (!this.frameCryptor.supported) {
+            const encryptionBtn = document.getElementById('toggle-encryption-btn');
+            encryptionBtn.title = 'Шифрование не поддерживается в этом браузере';
+            encryptionBtn.setAttribute('aria-disabled', 'true');
+        }
 
         // Layout controls
         document.getElementById('layout-btn').addEventListener('click', () => this.toggleLayoutSelector());
@@ -410,6 +371,13 @@ class CallingApp {
         // Video container
         this.videosContainer = document.getElementById('videos-container');
 
+        // Best-effort leave so peers are notified even on tab close
+        window.addEventListener('pagehide', () => {
+            if (this.roomId && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                try { this.ws.send(JSON.stringify({ type: 'leave' })); } catch (e) { /* ignore */ }
+            }
+        });
+
         // Check URL for room ID
         const urlParams = new URLSearchParams(window.location.search);
         const roomIdFromUrl = urlParams.get('room');
@@ -429,14 +397,19 @@ class CallingApp {
             console.log('WebSocket connected');
             this._wsReconnectAttempt = 0;
 
-            // If we were in a call, rejoin the room
-            if (this.roomId && this.clientId) {
+            if (this.pendingJoinRoomId) {
+                const roomId = this.pendingJoinRoomId;
+                this.pendingJoinRoomId = null;
+                this._sendWs({ type: 'join', roomId });
+            } else if (this.roomId && this.clientId && this.resumeToken) {
+                // We were in a call — rejoin the room with our old identity
                 console.log('Rejoining room after reconnect...');
-                this.ws.send(JSON.stringify({
+                this._sendWs({
                     type: 'rejoin',
                     roomId: this.roomId,
-                    clientId: this.clientId
-                }));
+                    clientId: this.clientId,
+                    resumeToken: this.resumeToken
+                });
                 this.showToast('Соединение восстановлено');
             }
 
@@ -444,9 +417,15 @@ class CallingApp {
         };
 
         this.ws.onmessage = (event) => {
-            const message = JSON.parse(event.data);
+            let message;
+            try {
+                message = JSON.parse(event.data);
+            } catch (error) {
+                console.error('Malformed message from server');
+                return;
+            }
+            if (!message || typeof message.type !== 'string') return;
             if (message.type === 'pong') {
-                // Heartbeat response received
                 clearTimeout(this._heartbeatTimeout);
                 return;
             }
@@ -461,8 +440,14 @@ class CallingApp {
             console.log('WebSocket disconnected');
             this._stopHeartbeat();
 
-            if (this.roomId) {
-                this.updateConnectionStatus('Переподключение...');
+            // If the socket died between our 'join' and the server's 'joined',
+            // queue the join again so the reconnect retries it.
+            if (this._joining && !this.roomId && !this.pendingJoinRoomId && this._lastRequestedRoom) {
+                this.pendingJoinRoomId = this._lastRequestedRoom;
+            }
+
+            if (this.roomId || this.pendingJoinRoomId) {
+                this.updateConnectionStatus('Переподключение...', false);
                 this._scheduleReconnect();
             }
         };
@@ -493,7 +478,10 @@ class CallingApp {
     _scheduleReconnect() {
         if (this._wsReconnectAttempt >= this._wsMaxReconnectAttempts) {
             this.showToast('Не удалось восстановить соединение');
-            this.updateConnectionStatus('Отключено');
+            this.updateConnectionStatus('Отключено', false);
+            // Unblock the join buttons so the user can retry manually
+            this._joining = false;
+            this.pendingJoinRoomId = null;
             return;
         }
 
@@ -527,40 +515,30 @@ class CallingApp {
 
         switch (message.type) {
             case 'joined':
-                this.clientId = message.clientId;
-                this.roomId = message.roomId;
-                this.participants.set(this.clientId, { id: this.clientId, name: 'Вы' });
-                await this.startCall();
-                // Connect to existing participants
-                if (message.participants && message.participants.length > 0) {
-                    for (const participantId of message.participants) {
-                        this.participants.set(participantId, { id: participantId, name: `Участник ${participantId.substr(0, 4)}` });
-                        await this.createOffer(participantId);
-                    }
-                }
+                await this.handleJoined(message);
                 break;
 
             case 'peer-joined':
-                if (this.participants.size < MAX_PARTICIPANTS) {
-                    this.participants.set(message.clientId, { id: message.clientId, name: `Участник ${message.clientId.substr(0, 4)}` });
-                    this.updateConnectionStatus(`${this.participants.size} участников`);
-
-                    // If encryption is enabled, share key with new participant
-                    if (this.frameCryptor.encryptionEnabled) {
-                        const keyData = await this.frameCryptor.exportKey();
-                        const keyArray = Array.from(keyData);
-                        this._sendWs({
-                            type: 'encryption-key',
-                            keyData: keyArray,
-                            targetId: message.clientId
-                        });
-                        console.log('Sent encryption key to new participant:', message.clientId);
-                    }
-
-                    // New peer will create offer to us, we'll respond with answer
+                if (typeof message.clientId !== 'string') break;
+                if (this.participants.has(message.clientId)) {
+                    // The same identity was re-announced: the peer reconnected
+                    // and is about to send a fresh offer. Its old session (and
+                    // the data channel inside it) is dead — drop it so the
+                    // offer lands on a brand-new connection.
+                    this._dropPeerSession(message.clientId);
                 } else {
-                    console.warn('Max participants reached');
+                    if (this.participants.size >= this.maxParticipants) {
+                        console.warn('Max participants reached');
+                        break;
+                    }
+                    this.participants.set(message.clientId, {
+                        id: message.clientId,
+                        name: `Участник ${message.clientId.slice(0, 4)}`
+                    });
                 }
+                this.updateConnectionStatus(this.participantsLabel());
+                // The new peer creates offers to us; if encryption is on, the
+                // key is sent over the encrypted data channel once it opens.
                 break;
 
             case 'offer':
@@ -575,40 +553,103 @@ class CallingApp {
                 await this.handleIceCandidate(message);
                 break;
 
-            case 'encryption-key':
-                await this.handleEncryptionKey(message);
-                break;
-
-            case 'encryption-disabled':
-                this.handleEncryptionDisabled(message);
-                break;
-
-            case 'reaction':
-                this.handleReaction(message);
-                break;
-
             case 'peer-left':
                 this.handlePeerLeft(message.clientId);
+                break;
+
+            case 'room-full':
+                this._joining = false;
+                this.showToast(`Звонок заполнен (максимум ${message.maxParticipants || this.maxParticipants} участников)`);
+                if (!this.localStream) {
+                    this.roomId = null;
+                }
+                break;
+
+            case 'error':
+                this._joining = false;
+                this.showToast(message.text || 'Ошибка сервера');
                 break;
         }
     }
 
-    async createCall() {
-        this.roomId = this.generateRoomId();
-        this.joinRoom(this.roomId);
+    async handleJoined(message) {
+        this._joining = false;
+        this.roomId = message.roomId;
+        this.clientId = message.clientId;
+        if (typeof message.resumeToken === 'string') {
+            this.resumeToken = message.resumeToken;
+        }
+
+        // Stale peer connections (e.g. from before a reconnect) cannot be
+        // reused — tear everything down and renegotiate from scratch.
+        this.teardownPeers();
+
+        this.participants.clear();
+        this.participants.set(this.clientId, { id: this.clientId, name: 'Вы' });
+
+        const ok = await this.startCall();
+        if (!ok) return;
+
+        const others = Array.isArray(message.participants) ? message.participants : [];
+        for (const participantId of others) {
+            if (typeof participantId !== 'string' || participantId === this.clientId) continue;
+            this.participants.set(participantId, {
+                id: participantId,
+                name: `Участник ${participantId.slice(0, 4)}`
+            });
+            await this.createOffer(participantId);
+        }
+        this.updateConnectionStatus(this.participantsLabel());
+    }
+
+    participantsLabel() {
+        return this.participants.size > 1
+            ? `${this.participants.size} участников`
+            : 'Ожидание участников...';
+    }
+
+    // Closes every peer connection and clears all per-peer state and video
+    // tiles. Local media is kept alive.
+    teardownPeers() {
+        this._iceRestartTimers.forEach(timer => clearTimeout(timer));
+        this._iceRestartTimers.clear();
+        this._iceRestartAttempts.clear();
+
+        this.peerConnections.forEach(pc => pc.close());
+        this.peerConnections.clear();
+        this.controlChannels.clear();
+        this.pendingIceCandidates.clear();
+
+        this.audioContexts.forEach((audioSetup) => {
+            try {
+                audioSetup.source.disconnect();
+                audioSetup.gainNode.disconnect();
+            } catch (e) { /* already disconnected */ }
+        });
+        this.audioContexts.clear();
+
+        this.videosContainer.innerHTML = '';
+        this.updateGridLayout();
+    }
+
+    createCall() {
+        this.joinRoom(this.generateRoomId());
     }
 
     toggleJoinInput() {
         const container = document.getElementById('join-input-container');
         container.classList.toggle('hidden');
+        if (!container.classList.contains('hidden')) {
+            document.getElementById('room-id-input').focus();
+        }
     }
 
-    async joinCall() {
+    joinCall() {
         const input = document.getElementById('room-id-input');
         const roomId = input.value.trim().toUpperCase();
 
-        if (!roomId) {
-            this.showToast('Введите код звонка');
+        if (!ROOM_ID_PATTERN.test(roomId)) {
+            this.showToast('Код звонка — 6 символов: буквы A-Z и цифры');
             return;
         }
 
@@ -616,45 +657,73 @@ class CallingApp {
     }
 
     joinRoom(roomId) {
-        this._sendWs({
-            type: 'join',
-            roomId: roomId
-        });
+        if (this._joining || this.roomId) {
+            return;
+        }
+        this._joining = true;
+        this._lastRequestedRoom = roomId;
+
+        // Warm up the AudioContext while we are still in a user gesture —
+        // otherwise browsers keep it suspended and remote audio stays silent.
+        this.ensureAudioContext();
+
+        if (!this._sendWs({ type: 'join', roomId })) {
+            this.pendingJoinRoomId = roomId;
+            this.showToast('Подключение к серверу...');
+            if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+                this._cancelReconnect();
+                this.connectWebSocket();
+            }
+        }
     }
 
     async startCall() {
         try {
-            // Get user media
-            this.localStream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
-
-            // Add local video to grid
-            this.addVideoStream(this.clientId, this.localStream, true);
-
-            // Show call screen
-            this.homeScreen.classList.remove('active');
-            this.callScreen.classList.add('active');
-
-            // Update UI
-            document.getElementById('current-room-id').textContent = this.roomId;
-            this.updateConnectionStatus('Ожидание участников...');
-
-            // Initialize layout selector
-            document.querySelectorAll('.layout-option').forEach(option => {
-                option.classList.toggle('selected', option.dataset.layout === this.layoutMode);
-            });
-
-            // Update URL
-            const newUrl = `${window.location.origin}?room=${this.roomId}`;
-            window.history.pushState({}, '', newUrl);
-
+            if (!this.localStream || this.localStream.getTracks().every(t => t.readyState === 'ended')) {
+                this.localStream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
+            }
         } catch (error) {
             console.error('Error accessing media devices:', error);
             this.showToast('Не удалось получить доступ к камере/микрофону');
             this.endCall();
+            return false;
         }
+
+        // Honor current mute toggles (relevant after a rejoin)
+        this.localStream.getAudioTracks().forEach(t => { t.enabled = this.isAudioEnabled; });
+        this.localStream.getVideoTracks().forEach(t => { t.enabled = this.isVideoEnabled; });
+
+        // Add local video to grid
+        this.addVideoStream(this.clientId, this.localStream, true);
+
+        // Show call screen
+        this.homeScreen.classList.remove('active');
+        this.callScreen.classList.add('active');
+
+        // Update UI
+        document.getElementById('current-room-id').textContent = this.roomId;
+        this.updateConnectionStatus('Ожидание участников...');
+        this.updateEncryptionUI(this.frameCryptor.encryptionEnabled);
+
+        // Initialize layout selector
+        document.querySelectorAll('.layout-option').forEach(option => {
+            option.classList.toggle('selected', option.dataset.layout === this.layoutMode);
+        });
+
+        // Update URL (replaceState — joining a call should not pollute history)
+        window.history.replaceState({}, '', `${window.location.origin}?room=${encodeURIComponent(this.roomId)}`);
+
+        return true;
     }
 
     addVideoStream(clientId, stream, isLocal = false) {
+        // ontrack fires once per track (audio + video) with the same stream —
+        // don't rebuild the tile if it is already showing this stream.
+        const existingVideo = document.getElementById(`video-${clientId}`);
+        if (existingVideo && existingVideo.srcObject === stream) {
+            return;
+        }
+
         // Remove existing video if present
         this.removeVideoStream(clientId);
 
@@ -666,7 +735,8 @@ class CallingApp {
         video.id = `video-${clientId}`;
         video.srcObject = stream;
         video.autoplay = true;
-        video.playsinline = true;
+        video.playsInline = true;
+        video.setAttribute('playsinline', '');
         // Mute all videos initially — local stays muted, remote audio is
         // routed through Web Audio API in setupVolumeControl().
         // This also ensures autoplay works on iOS Safari.
@@ -676,9 +746,23 @@ class CallingApp {
         label.className = 'video-label';
         const participant = this.participants.get(clientId);
         label.textContent = participant ? participant.name : (isLocal ? 'Вы' : 'Участник');
+        // Restore the mute indicator across tile rebuilds (e.g. after rejoin)
+        const labelMuted = isLocal ? !this.isAudioEnabled : !!(participant && participant.audioMuted);
+        label.classList.toggle('muted', labelMuted);
 
         wrapper.appendChild(video);
         wrapper.appendChild(label);
+
+        // Tap/click toggles the per-tile controls overlay
+        wrapper.addEventListener('click', () => {
+            const wasShowing = wrapper.classList.contains('show-controls');
+            document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
+                w.classList.remove('show-controls');
+            });
+            if (!wasShowing) {
+                wrapper.classList.add('show-controls');
+            }
+        });
 
         if (isLocal) {
             // Mirror local video by default and add toggle
@@ -687,20 +771,10 @@ class CallingApp {
                 wrapper.classList.add('mirrored');
             }
 
-            // Add click handler to show controls on local video too
-            wrapper.addEventListener('click', () => {
-                const wasShowing = wrapper.classList.contains('show-controls');
-                document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
-                    w.classList.remove('show-controls');
-                });
-                if (!wasShowing) {
-                    wrapper.classList.add('show-controls');
-                }
-            });
-
             const mirrorBtn = document.createElement('button');
             mirrorBtn.className = 'mirror-btn' + (isMirrored ? ' active' : '');
             mirrorBtn.title = 'Зеркалировать видео';
+            mirrorBtn.setAttribute('aria-label', 'Зеркалировать видео');
             mirrorBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h3"/><path d="M16 3h3a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-3"/><line x1="12" y1="3" x2="12" y2="21" stroke-dasharray="2 2"/></svg>';
             mirrorBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
@@ -710,30 +784,12 @@ class CallingApp {
                 localStorage.setItem('localVideoMirrored', nowMirrored);
             });
             wrapper.appendChild(mirrorBtn);
-        }
-
-        // Add volume control button for remote participants
-        if (!isLocal) {
-            // Add click handler to show controls
-            wrapper.addEventListener('click', (e) => {
-                // Toggle controls visibility
-                const wasShowing = wrapper.classList.contains('show-controls');
-
-                // Hide controls on all other videos
-                document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
-                    w.classList.remove('show-controls');
-                });
-
-                // Show controls on this video if it wasn't showing before
-                if (!wasShowing) {
-                    wrapper.classList.add('show-controls');
-                }
-            });
-
-            const volumeBtn = document.createElement('div');
+        } else {
+            const volumeBtn = document.createElement('button');
             volumeBtn.className = 'volume-btn';
-            volumeBtn.innerHTML = '🔊';
+            volumeBtn.textContent = '🔊';
             volumeBtn.title = 'Регулировка громкости';
+            volumeBtn.setAttribute('aria-label', 'Регулировка громкости участника');
             volumeBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 this.showVolumeControl(clientId, volumeBtn);
@@ -796,9 +852,8 @@ class CallingApp {
     getEffectiveLayout(participantCount) {
         if (this.layoutMode === 'auto') {
             // Auto mode: smart selection based on participant count
-            if (participantCount === 1) return 'grid';
-            if (participantCount === 2) return 'grid';
-            if (participantCount >= 3) return 'spotlight';
+            if (participantCount <= 2) return 'grid';
+            return 'spotlight';
         }
         return this.layoutMode;
     }
@@ -835,48 +890,75 @@ class CallingApp {
     }
 
     createPeerConnection(remoteClientId) {
-        const pcConfig = { ...config };
-        // Only enable encodedInsertableStreams when encryption is active
-        // (setting this flag without piping the streams causes frame loss)
-        if (this.frameCryptor.useLegacyStreams && this.frameCryptor.encryptionEnabled) {
+        // Close a stale connection first so it can never leak
+        const existing = this.peerConnections.get(remoteClientId);
+        if (existing) {
+            existing.close();
+        }
+
+        const pcConfig = { ...this.rtcConfig };
+        if (this.frameCryptor.useLegacyStreams) {
+            // Legacy insertable streams must be requested at construction.
+            // Pass-through transforms are installed immediately below, so
+            // media flows whether or not encryption is currently on.
             pcConfig.encodedInsertableStreams = true;
         }
         const pc = new RTCPeerConnection(pcConfig);
         this.peerConnections.set(remoteClientId, pc);
 
-        // Add local tracks
+        this.setupControlChannel(pc, remoteClientId);
+
+        // Add local tracks; encryption transforms are installed up front and
+        // stay in pass-through mode until encryption is enabled.
         this.localStream.getTracks().forEach(track => {
             const sender = pc.addTrack(track, this.localStream);
-
-            // Set up encryption transform if encryption is active
-            if (this.frameCryptor.encryptionEnabled) {
-                this.frameCryptor.setupSenderTransform(sender, track.id);
-            }
+            this.frameCryptor.setupSenderTransform(sender);
         });
+
+        // Whole-frame encryption is safe only for codecs whose RTP packetizer
+        // treats the payload as opaque. H.264 packetization parses NAL units,
+        // so put VP8 first while keeping the rest as fallback.
+        if (this.frameCryptor.supported &&
+            typeof RTCRtpTransceiver !== 'undefined' &&
+            RTCRtpTransceiver.prototype.setCodecPreferences &&
+            typeof RTCRtpReceiver !== 'undefined' && RTCRtpReceiver.getCapabilities) {
+            try {
+                const caps = RTCRtpReceiver.getCapabilities('video');
+                const vp8 = caps.codecs.filter(c => /vp8/i.test(c.mimeType));
+                const rest = caps.codecs.filter(c => !/vp8/i.test(c.mimeType));
+                if (vp8.length > 0) {
+                    pc.getTransceivers().forEach(transceiver => {
+                        const track = transceiver.sender && transceiver.sender.track;
+                        if (track && track.kind === 'video') {
+                            transceiver.setCodecPreferences([...vp8, ...rest]);
+                        }
+                    });
+                }
+            } catch (error) {
+                console.warn('Could not set codec preferences:', error);
+            }
+        }
 
         // Handle remote stream
         pc.ontrack = (event) => {
             console.log('Received remote track from:', remoteClientId);
-            this.addVideoStream(remoteClientId, event.streams[0], false);
-            this.updateConnectionStatus(`${this.participants.size} участников`);
-
-            // Set up receiver transform only if encryption is already active
-            if (this.frameCryptor.encryptionEnabled && event.receiver) {
+            if (event.receiver) {
                 this.frameCryptor.setupReceiverTransform(event.receiver);
             }
+            const stream = event.streams && event.streams[0];
+            if (!stream) return;
+            this.addVideoStream(remoteClientId, stream, false);
+            this.updateConnectionStatus(this.participantsLabel());
         };
 
         // Handle ICE candidates
         pc.onicecandidate = (event) => {
             if (event.candidate) {
-                console.log('Sending ICE candidate to:', remoteClientId, event.candidate.type);
                 this._sendWs({
                     type: 'ice-candidate',
                     candidate: event.candidate,
                     targetId: remoteClientId
                 });
-            } else {
-                console.log('All ICE candidates sent to:', remoteClientId);
             }
         };
 
@@ -890,19 +972,19 @@ class CallingApp {
                     // Reset ICE restart counter on success
                     this._iceRestartAttempts.delete(remoteClientId);
                     this._clearIceRestartTimer(remoteClientId);
-                    this.updateConnectionStatus(`${this.participants.size} участников`, true);
+                    this.updateConnectionStatus(this.participantsLabel(), true);
                     break;
                 case 'failed':
                     console.error('ICE connection failed for:', remoteClientId);
                     this._attemptIceRestart(remoteClientId);
                     break;
                 case 'disconnected':
-                    this.updateConnectionStatus('Переподключение...');
+                    this.updateConnectionStatus('Переподключение...', false);
                     // Start a timer — if not recovered in 5s, try ICE restart
                     this._clearIceRestartTimer(remoteClientId);
                     this._iceRestartTimers.set(remoteClientId, setTimeout(() => {
                         const currentPc = this.peerConnections.get(remoteClientId);
-                        if (currentPc && currentPc.iceConnectionState === 'disconnected') {
+                        if (currentPc === pc && pc.iceConnectionState === 'disconnected') {
                             console.log(`Peer ${remoteClientId} still disconnected, attempting ICE restart`);
                             this._attemptIceRestart(remoteClientId);
                         }
@@ -914,30 +996,176 @@ class CallingApp {
         // Handle connection state
         pc.onconnectionstatechange = () => {
             console.log(`Connection state (${remoteClientId}):`, pc.connectionState);
-            if (pc.connectionState === 'failed') {
+            if (pc.connectionState === 'failed' && this.peerConnections.get(remoteClientId) === pc) {
                 // Full reconnect — close old connection and create new one
                 this._reconnectPeer(remoteClientId);
             }
         };
 
-        // Handle ICE gathering state
-        pc.onicegatheringstatechange = () => {
-            console.log(`ICE gathering state (${remoteClientId}):`, pc.iceGatheringState);
-        };
-
         return pc;
     }
 
-    async createOffer(remoteClientId) {
-        const pc = this.createPeerConnection(remoteClientId);
+    // The control channel is a DTLS-encrypted, peer-to-peer side channel used
+    // for E2EE key exchange, reactions and mute-state sync. The signaling
+    // server never sees any of it.
+    setupControlChannel(pc, remoteClientId) {
+        const channel = pc.createDataChannel('control', { negotiated: true, id: 0 });
+
+        channel.onopen = () => {
+            this.controlChannels.set(remoteClientId, channel);
+            this.sendControl(remoteClientId, {
+                kind: 'mute-state',
+                audio: this.isAudioEnabled,
+                video: this.isVideoEnabled
+            });
+            if (this.frameCryptor.encryptionEnabled && this.frameCryptor.rawKeyData) {
+                this.sendControl(remoteClientId, {
+                    kind: 'e2ee-key',
+                    key: Array.from(this.frameCryptor.rawKeyData),
+                    owner: this.keyOwner
+                });
+            }
+        };
+
+        channel.onclose = () => {
+            if (this.controlChannels.get(remoteClientId) === channel) {
+                this.controlChannels.delete(remoteClientId);
+            }
+        };
+
+        channel.onmessage = (event) => {
+            this.handleControlMessage(remoteClientId, event.data);
+        };
+    }
+
+    sendControl(remoteClientId, payload) {
+        const channel = this.controlChannels.get(remoteClientId);
+        if (channel && channel.readyState === 'open') {
+            try {
+                channel.send(JSON.stringify(payload));
+                return true;
+            } catch (error) {
+                console.warn('Control channel send failed:', error);
+            }
+        }
+        return false;
+    }
+
+    broadcastControl(payload) {
+        this.controlChannels.forEach((_, clientId) => this.sendControl(clientId, payload));
+    }
+
+    async handleControlMessage(senderId, raw) {
+        let message;
+        try {
+            message = JSON.parse(raw);
+        } catch (error) {
+            return;
+        }
+        if (!message || typeof message !== 'object') return;
+
+        switch (message.kind) {
+            case 'e2ee-key':
+                await this.handleRemoteEncryptionKey(senderId, message.key, message.owner);
+                break;
+            case 'e2ee-off':
+                this.handleRemoteEncryptionDisabled(senderId);
+                break;
+            case 'e2ee-unsupported':
+                this.showToast('⚠️ Браузер участника не поддерживает шифрование — его медиа скрыто');
+                break;
+            case 'reaction':
+                this.handleRemoteReaction(senderId, message.emoji);
+                break;
+            case 'mute-state':
+                this.handleRemoteMuteState(senderId, message);
+                break;
+        }
+    }
+
+    async handleRemoteEncryptionKey(senderId, key, owner) {
+        if (!Array.isArray(key) || key.length !== E2EE_KEY_BYTES ||
+            !key.every(b => Number.isInteger(b) && b >= 0 && b <= 255)) {
+            console.warn('Ignoring invalid encryption key from', senderId);
+            return;
+        }
+        if (!this.frameCryptor.supported) {
+            this.showToast('Участник включил шифрование, но ваш браузер его не поддерживает');
+            // Let the room know this participant cannot encrypt, so others
+            // understand why our media disappears under their lock indicator.
+            this.sendControl(senderId, { kind: 'e2ee-unsupported' });
+            return;
+        }
+        const keyOwner = typeof owner === 'string' && owner ? owner : senderId;
 
         try {
-            const offer = await pc.createOffer();
+            const keyData = new Uint8Array(key);
+
+            // Two peers can enable encryption simultaneously with different
+            // keys. Converge deterministically on the key whose originator
+            // id is lexicographically smallest; the loser re-asserts nothing,
+            // the winner re-sends its key to the sender.
+            if (this.frameCryptor.encryptionEnabled && this.frameCryptor.rawKeyData &&
+                !this.frameCryptor.hasSameKey(keyData) &&
+                this.keyOwner && this.keyOwner <= keyOwner) {
+                this.sendControl(senderId, {
+                    kind: 'e2ee-key',
+                    key: Array.from(this.frameCryptor.rawKeyData),
+                    owner: this.keyOwner
+                });
+                return;
+            }
+
+            const alreadyActive = this.frameCryptor.encryptionEnabled && this.frameCryptor.hasSameKey(keyData);
+            if (!this.frameCryptor.hasSameKey(keyData)) {
+                await this.frameCryptor.setKey(keyData);
+            }
+            this.keyOwner = keyOwner;
+            this.frameCryptor.enable();
+            this.updateEncryptionUI(true);
+            if (!alreadyActive) {
+                console.log('Encryption key received from:', senderId);
+                this.showToast('🔒 Шифрование включено');
+            }
+        } catch (error) {
+            console.error('Error handling encryption key:', error);
+            this.showToast('Ошибка получения ключа шифрования');
+        }
+    }
+
+    handleRemoteEncryptionDisabled(senderId) {
+        if (!this.frameCryptor.encryptionEnabled) return;
+        this.frameCryptor.disable();
+        this.keyOwner = null;
+        this.updateEncryptionUI(false);
+        console.log('Encryption disabled by:', senderId);
+        this.showToast('🔓 Шифрование выключено');
+    }
+
+    handleRemoteMuteState(senderId, message) {
+        // Remember the state so a rebuilt video tile restores the indicator
+        const participant = this.participants.get(senderId);
+        if (participant) {
+            participant.audioMuted = message.audio === false;
+        }
+        const label = document.querySelector(`#video-wrapper-${CSS.escape(senderId)} .video-label`);
+        if (label) {
+            label.classList.toggle('muted', message.audio === false);
+        }
+    }
+
+    async createOffer(remoteClientId, options) {
+        const pc = this.peerConnections.get(remoteClientId) && options && options.iceRestart
+            ? this.peerConnections.get(remoteClientId)
+            : this.createPeerConnection(remoteClientId);
+
+        try {
+            const offer = await pc.createOffer(options);
             await pc.setLocalDescription(offer);
 
             this._sendWs({
                 type: 'offer',
-                offer: offer,
+                offer: pc.localDescription,
                 targetId: remoteClientId
             });
         } catch (error) {
@@ -946,6 +1174,8 @@ class CallingApp {
     }
 
     async handleOffer(message) {
+        if (typeof message.senderId !== 'string' || !message.offer) return;
+
         // Ensure we have local stream before creating peer connection
         if (!this.localStream) {
             try {
@@ -958,9 +1188,33 @@ class CallingApp {
             }
         }
 
-        const pc = this.createPeerConnection(message.senderId);
+        // An offer can arrive before the peer-joined notification
+        if (!this.participants.has(message.senderId)) {
+            this.participants.set(message.senderId, {
+                id: message.senderId,
+                name: `Участник ${message.senderId.slice(0, 4)}`
+            });
+        }
+
+        // Reuse the existing connection (ICE restarts arrive as plain offers);
+        // only build a fresh one if we have none.
+        let pc = this.peerConnections.get(message.senderId);
+        if (!pc || pc.connectionState === 'closed') {
+            pc = this.createPeerConnection(message.senderId);
+        }
 
         try {
+            if (pc.signalingState === 'have-local-offer') {
+                // Glare: both sides sent an offer. The peer with the smaller
+                // id wins as offerer; the other rolls back and answers.
+                const polite = this.clientId > message.senderId;
+                if (!polite) {
+                    console.log('Offer collision — ignoring remote offer (impolite peer)');
+                    return;
+                }
+                await pc.setLocalDescription({ type: 'rollback' });
+            }
+
             await pc.setRemoteDescription(new RTCSessionDescription(message.offer));
 
             // Process any pending ICE candidates
@@ -971,7 +1225,7 @@ class CallingApp {
 
             this._sendWs({
                 type: 'answer',
-                answer: answer,
+                answer: pc.localDescription,
                 targetId: message.senderId
             });
         } catch (error) {
@@ -980,9 +1234,11 @@ class CallingApp {
     }
 
     async handleAnswer(message) {
+        if (typeof message.senderId !== 'string' || !message.answer) return;
         try {
             const pc = this.peerConnections.get(message.senderId);
-            if (pc) {
+            // Only apply an answer if we are actually waiting for one
+            if (pc && pc.signalingState === 'have-local-offer') {
                 await pc.setRemoteDescription(new RTCSessionDescription(message.answer));
                 await this.processPendingIceCandidates(message.senderId);
             }
@@ -992,6 +1248,7 @@ class CallingApp {
     }
 
     async handleIceCandidate(message) {
+        if (typeof message.senderId !== 'string' || !message.candidate) return;
         try {
             const pc = this.peerConnections.get(message.senderId);
             if (pc) {
@@ -1006,7 +1263,6 @@ class CallingApp {
                         this.pendingIceCandidates.set(message.senderId, []);
                     }
                     this.pendingIceCandidates.get(message.senderId).push(candidate);
-                    console.log(`Buffered ICE candidate for ${message.senderId}`);
                 }
             }
         } catch (error) {
@@ -1034,6 +1290,21 @@ class CallingApp {
         }
     }
 
+    // Drops a peer's transport session (connection, data channel, buffered
+    // candidates) but keeps the participant and its video tile — used when
+    // the peer is reconnecting and a fresh offer is on its way.
+    _dropPeerSession(clientId) {
+        this._clearIceRestartTimer(clientId);
+        this._iceRestartAttempts.delete(clientId);
+        const pc = this.peerConnections.get(clientId);
+        if (pc) {
+            pc.close();
+            this.peerConnections.delete(clientId);
+        }
+        this.controlChannels.delete(clientId);
+        this.pendingIceCandidates.delete(clientId);
+    }
+
     _clearIceRestartTimer(clientId) {
         const timer = this._iceRestartTimers.get(clientId);
         if (timer) {
@@ -1057,20 +1328,9 @@ class CallingApp {
         console.log(`ICE restart attempt ${attempt}/${this._maxIceRestarts} for ${clientId} in ${delay}ms`);
 
         this._clearIceRestartTimer(clientId);
-        this._iceRestartTimers.set(clientId, setTimeout(async () => {
-            const pc = this.peerConnections.get(clientId);
-            if (!pc) return;
-
-            try {
-                const offer = await pc.createOffer({ iceRestart: true });
-                await pc.setLocalDescription(offer);
-                this._sendWs({
-                    type: 'offer',
-                    offer: offer,
-                    targetId: clientId
-                });
-            } catch (error) {
-                console.error('Error during ICE restart:', error);
+        this._iceRestartTimers.set(clientId, setTimeout(() => {
+            if (this.peerConnections.has(clientId)) {
+                this.createOffer(clientId, { iceRestart: true });
             }
         }, delay));
     }
@@ -1088,7 +1348,7 @@ class CallingApp {
             oldPc.close();
             this.peerConnections.delete(clientId);
         }
-
+        this.controlChannels.delete(clientId);
         this.pendingIceCandidates.delete(clientId);
 
         // Create new connection and offer
@@ -1101,6 +1361,7 @@ class CallingApp {
     }
 
     handlePeerLeft(clientId) {
+        if (typeof clientId !== 'string' || !this.participants.has(clientId)) return;
         console.log('Peer left:', clientId);
 
         // Clean up reconnection state
@@ -1113,18 +1374,20 @@ class CallingApp {
             pc.close();
             this.peerConnections.delete(clientId);
         }
+        this.controlChannels.delete(clientId);
 
         // Remove video
         this.removeVideoStream(clientId);
 
         // Remove from participants
         this.participants.delete(clientId);
+        delete this.volumeSettings[clientId];
 
         // Clean up pending candidates
         this.pendingIceCandidates.delete(clientId);
 
         this.showToast('Участник покинул звонок');
-        this.updateConnectionStatus(`${this.participants.size} участников`);
+        this.updateConnectionStatus(this.participantsLabel());
     }
 
     toggleAudio() {
@@ -1143,10 +1406,16 @@ class CallingApp {
             audioOff.classList.toggle('hidden', this.isAudioEnabled);
 
             // Update label
-            const label = document.querySelector(`#video-wrapper-${this.clientId} .video-label`);
+            const label = document.querySelector(`#video-wrapper-${CSS.escape(this.clientId)} .video-label`);
             if (label) {
                 label.classList.toggle('muted', !this.isAudioEnabled);
             }
+
+            this.broadcastControl({
+                kind: 'mute-state',
+                audio: this.isAudioEnabled,
+                video: this.isVideoEnabled
+            });
         }
     }
 
@@ -1164,6 +1433,12 @@ class CallingApp {
             btn.classList.toggle('active', this.isVideoEnabled);
             videoOn.classList.toggle('hidden', !this.isVideoEnabled);
             videoOff.classList.toggle('hidden', this.isVideoEnabled);
+
+            this.broadcastControl({
+                kind: 'mute-state',
+                audio: this.isAudioEnabled,
+                video: this.isVideoEnabled
+            });
         }
     }
 
@@ -1179,127 +1454,36 @@ class CallingApp {
         indicator.classList.toggle('hidden', !enabled);
     }
 
-    setupEncryptionTransforms() {
-        if (this.frameCryptor.useScriptTransform) {
-            // RTCRtpScriptTransform can be assigned to existing senders/receivers
-            this.peerConnections.forEach((pc) => {
-                pc.getSenders().forEach(sender => {
-                    if (sender.track) {
-                        this.frameCryptor.setupSenderTransform(sender, sender.track.id);
-                    }
-                });
-                pc.getReceivers().forEach(receiver => {
-                    this.frameCryptor.setupReceiverTransform(receiver);
-                });
-            });
-        } else if (this.frameCryptor.useLegacyStreams) {
-            // Legacy API needs encodedInsertableStreams at PeerConnection creation
-            // Recreate all connections with the flag enabled
-            this._recreateAllPeerConnections();
-        }
-    }
-
-    async _recreateAllPeerConnections() {
-        const peerIds = Array.from(this.peerConnections.keys());
-        for (const peerId of peerIds) {
-            const oldPc = this.peerConnections.get(peerId);
-            if (oldPc) {
-                oldPc.close();
-                this.peerConnections.delete(peerId);
-            }
-            this.pendingIceCandidates.delete(peerId);
-            await this.createOffer(peerId);
-        }
-    }
-
     async toggleEncryption() {
+        if (!this.frameCryptor.supported) {
+            this.showToast('Шифрование не поддерживается в этом браузере');
+            return;
+        }
+
         const enabling = !this.frameCryptor.encryptionEnabled;
 
         if (enabling) {
-            if (!this.frameCryptor.supported) {
-                this.showToast('Шифрование не поддерживается в этом браузере');
-                return;
-            }
-
-            // Generate key, enable flag first (so createPeerConnection sees it)
-            const keyData = await this.frameCryptor.exportKey();
+            // A fresh key on every enable doubles as key rotation: toggling
+            // off and on after someone leaves locks the old key out.
+            await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
+            this.keyOwner = this.clientId;
             this.frameCryptor.enable();
-
-            // Share key with peers
-            await this.broadcastEncryptionKey(keyData);
-
-            // Set up transforms for existing connections
-            this.setupEncryptionTransforms();
-
+            // The key travels only over DTLS-encrypted peer-to-peer data
+            // channels — the signaling server never sees it.
+            this.broadcastControl({
+                kind: 'e2ee-key',
+                key: Array.from(this.frameCryptor.rawKeyData),
+                owner: this.keyOwner
+            });
             this.showToast('🔒 Шифрование включено');
         } else {
             this.frameCryptor.disable();
-            this.broadcastEncryptionDisabled();
-
-            // For legacy API, recreate connections without encodedInsertableStreams
-            if (this.frameCryptor.useLegacyStreams) {
-                this.frameCryptor.clearTransforms();
-                this._recreateAllPeerConnections();
-            }
-
+            this.keyOwner = null;
+            this.broadcastControl({ kind: 'e2ee-off' });
             this.showToast('🔓 Шифрование выключено');
         }
 
         this.updateEncryptionUI(enabling);
-    }
-
-    broadcastToParticipants(message) {
-        this.participants.forEach((_, clientId) => {
-            if (clientId !== this.clientId) {
-                this._sendWs({ ...message, targetId: clientId });
-            }
-        });
-    }
-
-    async broadcastEncryptionKey(keyData) {
-        this.broadcastToParticipants({ type: 'encryption-key', keyData: Array.from(keyData) });
-    }
-
-    broadcastEncryptionDisabled() {
-        this.broadcastToParticipants({ type: 'encryption-disabled' });
-    }
-
-    async handleEncryptionKey(message) {
-        try {
-            const keyData = new Uint8Array(message.keyData);
-            await this.frameCryptor.setKey(keyData);
-
-            // Set up transforms (skips already-set-up ones)
-            this.setupEncryptionTransforms();
-
-            // Enable — transforms start encrypting
-            this.frameCryptor.enable();
-
-            this.updateEncryptionUI(true);
-            console.log('Encryption key received from:', message.senderId);
-            this.showToast('🔒 Шифрование включено');
-        } catch (error) {
-            console.error('Error handling encryption key:', error);
-            this.showToast('Ошибка получения ключа шифрования');
-        }
-    }
-
-    handleEncryptionDisabled(message) {
-        try {
-            this.frameCryptor.disable();
-
-            // For legacy API, recreate connections without encodedInsertableStreams
-            if (this.frameCryptor.useLegacyStreams) {
-                this.frameCryptor.clearTransforms();
-                this._recreateAllPeerConnections();
-            }
-
-            this.updateEncryptionUI(false);
-            console.log('Encryption disabled by:', message.senderId);
-            this.showToast('🔓 Шифрование выключено');
-        } catch (error) {
-            console.error('Error handling encryption disabled:', error);
-        }
     }
 
     // Reactions System
@@ -1320,7 +1504,9 @@ class CallingApp {
     }
 
     saveReactionCounts() {
-        localStorage.setItem('reactionCounts', JSON.stringify(this.reactionCounts));
+        try {
+            localStorage.setItem('reactionCounts', JSON.stringify(this.reactionCounts));
+        } catch (e) { /* storage full or unavailable */ }
     }
 
     getSortedReactions() {
@@ -1377,7 +1563,7 @@ class CallingApp {
     }
 
     sendReaction(emoji) {
-        if (!this.roomId) return;
+        if (!this.roomId || !this.reactions.includes(emoji)) return;
 
         // Increment local count
         this.reactionCounts[emoji] = (this.reactionCounts[emoji] || 0) + 1;
@@ -1389,25 +1575,23 @@ class CallingApp {
         // Play sound
         this.playReactionSound();
 
-        // Send to all participants
-        this.broadcastToParticipants({ type: 'reaction', emoji });
-
-        console.log('Sent reaction:', emoji);
+        // Send to all participants over peer-to-peer data channels
+        this.broadcastControl({ kind: 'reaction', emoji });
     }
 
-    handleReaction(message) {
-        const emoji = message.emoji;
-        console.log('Received reaction:', emoji, 'from:', message.senderId);
+    handleRemoteReaction(senderId, emoji) {
+        // Only render reactions from the known set — never arbitrary strings
+        if (!this.reactions.includes(emoji)) return;
+        console.log('Received reaction:', emoji, 'from:', senderId);
 
-        // Show flying emoji
         this.showFlyingReaction(emoji);
-
-        // Play sound
         this.playReactionSound();
     }
 
     showFlyingReaction(emoji) {
         const overlay = document.getElementById('reactions-overlay');
+        if (overlay.childElementCount >= MAX_FLYING_REACTIONS) return;
+
         const reaction = document.createElement('div');
         reaction.className = 'flying-reaction';
         reaction.textContent = emoji;
@@ -1442,43 +1626,25 @@ class CallingApp {
     }
 
     playReactionSound() {
-        const ctx = this.ensureAudioContext();
-        const oscillator = ctx.createOscillator();
-        const gainNode = ctx.createGain();
+        try {
+            const ctx = this.ensureAudioContext();
+            const oscillator = ctx.createOscillator();
+            const gainNode = ctx.createGain();
 
-        oscillator.connect(gainNode);
-        gainNode.connect(ctx.destination);
+            oscillator.connect(gainNode);
+            gainNode.connect(ctx.destination);
 
-        // Create a pleasant "pop" sound
-        oscillator.frequency.setValueAtTime(800, ctx.currentTime);
-        oscillator.frequency.exponentialRampToValueAtTime(400, ctx.currentTime + 0.1);
+            // Create a pleasant "pop" sound
+            oscillator.frequency.setValueAtTime(800, ctx.currentTime);
+            oscillator.frequency.exponentialRampToValueAtTime(400, ctx.currentTime + 0.1);
 
-        // Soft volume
-        gainNode.gain.setValueAtTime(0.1, ctx.currentTime);
-        gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
+            // Soft volume
+            gainNode.gain.setValueAtTime(0.1, ctx.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
 
-        oscillator.start(ctx.currentTime);
-        oscillator.stop(ctx.currentTime + 0.1);
-    }
-
-    // Volume Control System
-    loadVolumeSettings() {
-        const saved = localStorage.getItem('volumeSettings');
-        if (saved) {
-            try {
-                return JSON.parse(saved);
-            } catch (e) {
-                console.error('Error loading volume settings:', e);
-            }
-        }
-        return {};
-    }
-
-    saveVolumeSettings() {
-        clearTimeout(this._saveVolumeTimer);
-        this._saveVolumeTimer = setTimeout(() => {
-            localStorage.setItem('volumeSettings', JSON.stringify(this.volumeSettings));
-        }, 300);
+            oscillator.start(ctx.currentTime);
+            oscillator.stop(ctx.currentTime + 0.1);
+        } catch (e) { /* sound is best-effort */ }
     }
 
     setupVolumeControl(clientId, videoElement, stream) {
@@ -1506,8 +1672,6 @@ class CallingApp {
                 source: source,
                 gainNode: gainNode
             });
-
-            console.log(`Volume control setup for ${clientId}, initial volume: ${savedVolume}`);
         } catch (error) {
             console.error('Error setting up volume control:', error);
             // Fallback: unmute video element
@@ -1575,83 +1739,63 @@ class CallingApp {
             audioSetup.gainNode.gain.value = volume;
         }
 
-        // Save to settings
+        // Remember for this call session
         this.volumeSettings[clientId] = volume;
-        this.saveVolumeSettings();
 
         // Update badge
         const badge = document.getElementById(`volume-badge-${clientId}`);
         if (badge) {
             const percent = Math.round(volume * 100);
             badge.textContent = percent + '%';
-            if (percent !== 100) {
-                badge.classList.add('visible');
-            } else {
-                badge.classList.remove('visible');
-            }
+            badge.classList.toggle('visible', percent !== 100);
         }
-
-        console.log(`Set volume for ${clientId}: ${Math.round(volume * 100)}%`);
     }
 
     endCall() {
+        // Notify server first (teardown below closes nothing server-side)
+        if (this.roomId) {
+            this._sendWs({ type: 'leave' });
+        }
+
         // Stop local stream
         if (this.localStream) {
             this.localStream.getTracks().forEach(track => track.stop());
             this.localStream = null;
         }
 
-        // Clean up ICE restart timers
-        this._iceRestartTimers.forEach(timer => clearTimeout(timer));
-        this._iceRestartTimers.clear();
-        this._iceRestartAttempts.clear();
+        // Close all peer connections, channels, timers, audio nodes, tiles
+        this.teardownPeers();
 
-        // Close all peer connections
-        this.peerConnections.forEach((pc, clientId) => {
-            pc.close();
-        });
-        this.peerConnections.clear();
-
-        // Clean up all audio contexts
-        this.audioContexts.forEach((audioSetup, clientId) => {
-            try {
-                audioSetup.source.disconnect();
-                audioSetup.gainNode.disconnect();
-            } catch (e) {
-                console.log('Error disconnecting audio nodes:', e);
-            }
-        });
-        this.audioContexts.clear();
-
-        // Notify server
-        this._sendWs({ type: 'leave', roomId: this.roomId });
-
-        // Cancel any pending reconnection
+        // Cancel any pending WebSocket reconnection
         this._cancelReconnect();
-        this._stopHeartbeat();
 
-        // Reset encryption
-        this.frameCryptor.disable();
-        this.frameCryptor.clearTransforms();
+        // Reset encryption completely — the next call gets a fresh key
+        this.frameCryptor.reset();
+        this.updateEncryptionUI(false);
 
         // Reset state
         this.roomId = null;
         this.clientId = null;
+        this.resumeToken = null;
+        this.keyOwner = null;
+        this.pendingJoinRoomId = null;
+        this._lastRequestedRoom = null;
+        this._joining = false;
         this.participants.clear();
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
-        this.pendingIceCandidates.clear();
-
-        // Clear videos
-        this.videosContainer.innerHTML = '';
-        this.updateGridLayout();
+        this.volumeSettings = {};
+        this.currentVolumeTarget = null;
 
         // Update UI
         this.callScreen.classList.remove('active');
         this.homeScreen.classList.add('active');
+        document.getElementById('volume-control').classList.add('hidden');
+        document.getElementById('reactions-dropdown').classList.add('hidden');
+        document.getElementById('layout-selector').classList.add('hidden');
 
         // Reset URL
-        window.history.pushState({}, '', window.location.origin);
+        window.history.replaceState({}, '', window.location.origin);
 
         // Reset buttons
         const audioBtn = document.getElementById('toggle-audio-btn');
@@ -1665,7 +1809,7 @@ class CallingApp {
     }
 
     async copyLink() {
-        const link = `${window.location.origin}?room=${this.roomId}`;
+        const link = `${window.location.origin}?room=${encodeURIComponent(this.roomId)}`;
 
         try {
             await navigator.clipboard.writeText(link);
@@ -1691,22 +1835,26 @@ class CallingApp {
     }
 
     shareTelegram() {
-        const link = `${window.location.origin}?room=${this.roomId}`;
-        const text = `Присоединяйтесь к звонку: ${link}`;
+        const link = `${window.location.origin}?room=${encodeURIComponent(this.roomId)}`;
+        const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('Присоединяйтесь к звонку')}`;
 
         // Try Telegram WebApp API first
         if (window.Telegram && window.Telegram.WebApp) {
-            window.Telegram.WebApp.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('Присоединяйтесь к звонку')}`);
+            window.Telegram.WebApp.openTelegramLink(shareUrl);
         } else {
             // Fallback to standard share URL
-            window.open(`https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('Присоединяйтесь к звонку')}`, '_blank');
+            window.open(shareUrl, '_blank', 'noopener');
         }
     }
 
-    updateConnectionStatus(text, isConnected = false) {
+    updateConnectionStatus(text, isConnected) {
         const statusElement = document.getElementById('connection-status');
         statusElement.textContent = text;
-        statusElement.classList.toggle('connected', isConnected);
+        // Routine text refreshes (participant counts) leave the green
+        // "connected" state alone; only explicit true/false changes it.
+        if (typeof isConnected === 'boolean') {
+            statusElement.classList.toggle('connected', isConnected);
+        }
     }
 
     showToast(message) {
@@ -1722,9 +1870,14 @@ class CallingApp {
 
     generateRoomId() {
         const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+        // Rejection sampling over a CSPRNG: uniform and unpredictable
+        const limit = 256 - (256 % chars.length); // 252
         let result = '';
-        for (let i = 0; i < 6; i++) {
-            result += chars.charAt(Math.floor(Math.random() * chars.length));
+        while (result.length < 6) {
+            const [byte] = crypto.getRandomValues(new Uint8Array(1));
+            if (byte < limit) {
+                result += chars[byte % chars.length];
+            }
         }
         return result;
     }
