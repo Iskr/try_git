@@ -1,6 +1,6 @@
 {
   "name": "calling-service-webapp",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "WebRTC-based calling service for Telegram and native wrappers",
   "main": "server.js",
   "scripts": {
@@ -28,6 +28,6 @@
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }
