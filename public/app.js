@@ -13,6 +13,16 @@ const DEFAULT_RTC_CONFIG = {
 const MAX_PARTICIPANTS = 5;
 const ROOM_ID_PATTERN = /^[A-Z0-9]{6}$/;
 const MAX_FLYING_REACTIONS = 40;
+// Candidates buffered for a peer whose connection does not exist yet
+const MAX_PENDING_CANDIDATES = 60;
+// If the peer designated as offerer never offers, offer anyway after this.
+const NEGOTIATION_WATCHDOG_MS = 8000;
+
+const AUDIO_CONSTRAINTS = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true
+};
 
 const MEDIA_CONSTRAINTS = {
     video: {
@@ -20,12 +30,20 @@ const MEDIA_CONSTRAINTS = {
         height: { ideal: 720 },
         facingMode: 'user'
     },
-    audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-    }
+    audio: AUDIO_CONSTRAINTS
 };
+
+// WebKit renders a MediaStreamAudioSourceNode built from a *remote* WebRTC
+// stream as silence, and createMediaStreamSource does not throw when it
+// happens — so the failure cannot be caught, only avoided. On these browsers
+// remote audio has to come out of the media element itself.
+const WEBKIT_AUDIO_LIMITED = (() => {
+    const ua = navigator.userAgent || '';
+    const isIOS = /iP(hone|ad|od)/.test(ua) ||
+        (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+    const isSafari = /^((?!chrome|chromium|android|crios|fxios|edgios|edg).)*safari/i.test(ua);
+    return isIOS || isSafari;
+})();
 
 // Encrypted frame layout: [0xE2 0xEE 0x01][IV (12 bytes)][AES-GCM ciphertext]
 const E2EE_MAGIC = new Uint8Array([0xe2, 0xee, 0x01]);
@@ -222,6 +240,16 @@ class CallingApp {
         this.pendingJoinRoomId = null;
         this._lastRequestedRoom = null;
         this._joining = false;
+        // Set while a rejoin is in flight so a room-full/error reply can be
+        // told apart from an unrelated mid-call error.
+        this._rejoining = false;
+        // Single-flight guard for getUserMedia: two concurrent captures would
+        // orphan one stream whose tracks keep the camera on and ignore mute.
+        this._mediaPromise = null;
+        // Peers whose offer we are waiting for, so a lost offer cannot stall
+        // the pair forever. Map<clientId, timeoutId>
+        this._negotiationTimers = new Map();
+        this._sessionCounter = 0;
         // clientId of the participant whose E2EE key the room converged on
         this.keyOwner = null;
 
@@ -253,10 +281,16 @@ class CallingApp {
         this.audioContexts = new Map(); // Map<clientId, {context, gainNode, source}>
         this.volumeSettings = {};
         this.currentVolumeTarget = null;
+        // On WebKit the Web Audio output graph is silent for remote streams,
+        // so audio plays from the media element and per-participant gain is
+        // reduced to mute/unmute.
+        this.useWebAudioOutput = !WEBKIT_AUDIO_LIMITED;
         try { localStorage.removeItem('volumeSettings'); } catch (e) { /* ignore */ }
 
         this.initUI();
-        this.loadIceConfig();
+        // Peer connections must not be built before the ICE config arrives, or
+        // the first call of the session silently runs without TURN.
+        this._configPromise = this.loadIceConfig();
         this.connectWebSocket();
     }
 
@@ -371,11 +405,28 @@ class CallingApp {
         // Video container
         this.videosContainer = document.getElementById('videos-container');
 
-        // Best-effort leave so peers are notified even on tab close
-        window.addEventListener('pagehide', () => {
+        // Best-effort leave so peers are notified even on tab close. A page
+        // going into the back/forward cache is coming back, so it must keep
+        // its seat.
+        window.addEventListener('pagehide', (e) => {
+            if (e.persisted) return;
             if (this.roomId && this.ws && this.ws.readyState === WebSocket.OPEN) {
-                try { this.ws.send(JSON.stringify({ type: 'leave' })); } catch (e) { /* ignore */ }
+                try { this.ws.send(JSON.stringify({ type: 'leave' })); } catch (err) { /* ignore */ }
             }
+        });
+
+        window.addEventListener('pageshow', (e) => {
+            if (e.persisted && this.roomId) {
+                this._resumeAfterInterruption();
+            }
+        });
+
+        // Coming back from a background tab, a phone call or a dead network:
+        // reconnect immediately instead of waiting out the backoff, and wake
+        // the AudioContext that iOS suspends during audio interruptions.
+        window.addEventListener('online', () => this._resumeAfterInterruption());
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) this._resumeAfterInterruption();
         });
 
         // Check URL for room ID
@@ -388,6 +439,18 @@ class CallingApp {
     }
 
     connectWebSocket() {
+        // Detach the previous socket first: its onclose would otherwise
+        // schedule another reconnect and leave two live connections racing.
+        if (this.ws) {
+            this.ws.onopen = null;
+            this.ws.onmessage = null;
+            this.ws.onerror = null;
+            this.ws.onclose = null;
+            if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+                try { this.ws.close(); } catch (e) { /* already gone */ }
+            }
+        }
+
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}`;
 
@@ -404,6 +467,7 @@ class CallingApp {
             } else if (this.roomId && this.clientId && this.resumeToken) {
                 // We were in a call — rejoin the room with our old identity
                 console.log('Rejoining room after reconnect...');
+                this._rejoining = true;
                 this._sendWs({
                     type: 'rejoin',
                     roomId: this.roomId,
@@ -453,6 +517,20 @@ class CallingApp {
         };
     }
 
+    // Called whenever the page or the network comes back to life.
+    _resumeAfterInterruption() {
+        if (this.audioContext && this.audioContext.state !== 'running') {
+            this.audioContext.resume().catch(() => { /* needs a gesture */ });
+        }
+        if (!this.roomId && !this.pendingJoinRoomId) return;
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            return;
+        }
+        // Give up the backoff — the outage we were backing off from is over.
+        this._cancelReconnect();
+        this.connectWebSocket();
+    }
+
     _startHeartbeat() {
         this._stopHeartbeat();
         this._heartbeatTimer = setInterval(() => {
@@ -477,11 +555,20 @@ class CallingApp {
 
     _scheduleReconnect() {
         if (this._wsReconnectAttempt >= this._wsMaxReconnectAttempts) {
-            this.showToast('Не удалось восстановить соединение');
-            this.updateConnectionStatus('Отключено', false);
-            // Unblock the join buttons so the user can retry manually
             this._joining = false;
             this.pendingJoinRoomId = null;
+            if (this.roomId) {
+                // Staying on a call screen that can no longer signal is worse
+                // than ending the call: nothing would ever recover it, and the
+                // stale roomId blocks the user from starting a new one. The
+                // 'online' listener still catches a network that comes back
+                // before this point.
+                this.showToast('Соединение потеряно — звонок завершён');
+                this.endCall();
+                return;
+            }
+            this.showToast('Не удалось восстановить соединение');
+            this.updateConnectionStatus('Отключено', false);
             return;
         }
 
@@ -521,10 +608,9 @@ class CallingApp {
             case 'peer-joined':
                 if (typeof message.clientId !== 'string') break;
                 if (this.participants.has(message.clientId)) {
-                    // The same identity was re-announced: the peer reconnected
-                    // and is about to send a fresh offer. Its old session (and
-                    // the data channel inside it) is dead — drop it so the
-                    // offer lands on a brand-new connection.
+                    // The same identity was re-announced: the peer reconnected.
+                    // Its old session (and the data channel inside it) is dead
+                    // — drop it so negotiation restarts on a fresh connection.
                     this._dropPeerSession(message.clientId);
                 } else {
                     if (this.participants.size >= this.maxParticipants) {
@@ -537,8 +623,7 @@ class CallingApp {
                     });
                 }
                 this.updateConnectionStatus(this.participantsLabel());
-                // The new peer creates offers to us; if encryption is on, the
-                // key is sent over the encrypted data channel once it opens.
+                await this._beginNegotiation(message.clientId);
                 break;
 
             case 'offer':
@@ -559,6 +644,15 @@ class CallingApp {
 
             case 'room-full':
                 this._joining = false;
+                if (this._rejoining) {
+                    // Our seat was given away while we were offline. Nothing
+                    // the client does from here reaches the room, so end the
+                    // call instead of leaving a frozen call screen behind.
+                    this._rejoining = false;
+                    this.showToast('Место в звонке занято — звонок завершён');
+                    this.endCall();
+                    break;
+                }
                 this.showToast(`Звонок заполнен (максимум ${message.maxParticipants || this.maxParticipants} участников)`);
                 if (!this.localStream) {
                     this.roomId = null;
@@ -568,12 +662,19 @@ class CallingApp {
             case 'error':
                 this._joining = false;
                 this.showToast(message.text || 'Ошибка сервера');
+                // Only a failed rejoin is fatal; an unrelated mid-call error
+                // must not tear down a working call.
+                if (this._rejoining) {
+                    this._rejoining = false;
+                    this.endCall();
+                }
                 break;
         }
     }
 
     async handleJoined(message) {
         this._joining = false;
+        this._rejoining = false;
         this.roomId = message.roomId;
         this.clientId = message.clientId;
         if (typeof message.resumeToken === 'string') {
@@ -597,9 +698,43 @@ class CallingApp {
                 id: participantId,
                 name: `Участник ${participantId.slice(0, 4)}`
             });
-            await this.createOffer(participantId);
+            await this._beginNegotiation(participantId);
         }
         this.updateConnectionStatus(this.participantsLabel());
+    }
+
+    // Exactly one side of a pair offers, chosen by comparing client ids, so
+    // two peers reconnecting at the same moment cannot both offer and end up
+    // answering each other's dead sessions.
+    _shouldOffer(remoteClientId) {
+        return this.clientId < remoteClientId;
+    }
+
+    async _beginNegotiation(remoteClientId) {
+        this._clearNegotiationWatchdog(remoteClientId);
+        if (this._shouldOffer(remoteClientId)) {
+            await this.createOffer(remoteClientId);
+            return;
+        }
+        // We are the answerer. If the offer never arrives (a dropped message,
+        // a peer that crashed mid-negotiation), offer ourselves rather than
+        // waiting forever; the glare rules below settle any collision.
+        this._negotiationTimers.set(remoteClientId, setTimeout(() => {
+            this._negotiationTimers.delete(remoteClientId);
+            const pc = this.peerConnections.get(remoteClientId);
+            if (!this.participants.has(remoteClientId)) return;
+            if (pc && (pc.remoteDescription || pc.connectionState === 'connected')) return;
+            console.warn(`No offer from ${remoteClientId}, offering instead`);
+            this.createOffer(remoteClientId);
+        }, NEGOTIATION_WATCHDOG_MS));
+    }
+
+    _clearNegotiationWatchdog(remoteClientId) {
+        const timer = this._negotiationTimers.get(remoteClientId);
+        if (timer) {
+            clearTimeout(timer);
+            this._negotiationTimers.delete(remoteClientId);
+        }
     }
 
     participantsLabel() {
@@ -614,18 +749,15 @@ class CallingApp {
         this._iceRestartTimers.forEach(timer => clearTimeout(timer));
         this._iceRestartTimers.clear();
         this._iceRestartAttempts.clear();
+        this._negotiationTimers.forEach(timer => clearTimeout(timer));
+        this._negotiationTimers.clear();
 
         this.peerConnections.forEach(pc => pc.close());
         this.peerConnections.clear();
         this.controlChannels.clear();
         this.pendingIceCandidates.clear();
 
-        this.audioContexts.forEach((audioSetup) => {
-            try {
-                audioSetup.source.disconnect();
-                audioSetup.gainNode.disconnect();
-            } catch (e) { /* already disconnected */ }
-        });
+        this.audioContexts.forEach((audioSetup) => this._disconnectAudio(audioSetup));
         this.audioContexts.clear();
 
         this.videosContainer.innerHTML = '';
@@ -677,14 +809,68 @@ class CallingApp {
         }
     }
 
+    // Single-flight capture. Two concurrent getUserMedia calls (startCall
+    // racing an incoming offer) would leave one stream orphaned: its tracks
+    // stay live after endCall and ignore the mute button, because toggles only
+    // touch the stream that happened to win.
+    acquireLocalMedia() {
+        if (this.localStream && this.localStream.getTracks().some(t => t.readyState === 'live')) {
+            return Promise.resolve(this.localStream);
+        }
+        if (this._mediaPromise) {
+            return this._mediaPromise;
+        }
+
+        this._mediaPromise = (async () => {
+            try {
+                return await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
+            } catch (error) {
+                // A missing, blocked or busy camera must not keep someone out
+                // of a call they can still take with audio only.
+                if (error && error.name === 'NotAllowedError') {
+                    throw error;
+                }
+                console.warn('Camera unavailable, falling back to audio only:', error && error.name);
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS, video: false });
+                this.showToast('Камера недоступна — звонок только с микрофоном');
+                return stream;
+            }
+        })();
+
+        this._mediaPromise
+            .then((stream) => {
+                if (this.localStream && this.localStream !== stream) {
+                    this.localStream.getTracks().forEach(t => t.stop());
+                }
+                this.localStream = stream;
+            })
+            .catch(() => { /* reported by the caller */ })
+            // A denied prompt must not poison every later attempt
+            .finally(() => { this._mediaPromise = null; });
+
+        return this._mediaPromise;
+    }
+
+    mediaErrorMessage(error) {
+        switch (error && error.name) {
+            case 'NotAllowedError':
+                return 'Доступ к камере и микрофону запрещён — разрешите его в настройках браузера';
+            case 'NotFoundError':
+            case 'OverconstrainedError':
+                return 'Микрофон не найден';
+            case 'NotReadableError':
+                return 'Камера или микрофон заняты другим приложением';
+            default:
+                return 'Не удалось получить доступ к камере/микрофону';
+        }
+    }
+
     async startCall() {
         try {
-            if (!this.localStream || this.localStream.getTracks().every(t => t.readyState === 'ended')) {
-                this.localStream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
-            }
+            await this.acquireLocalMedia();
         } catch (error) {
             console.error('Error accessing media devices:', error);
-            this.showToast('Не удалось получить доступ к камере/микрофону');
+            this.showToast(this.mediaErrorMessage(error));
             this.endCall();
             return false;
         }
@@ -737,10 +923,10 @@ class CallingApp {
         video.autoplay = true;
         video.playsInline = true;
         video.setAttribute('playsinline', '');
-        // Mute all videos initially — local stays muted, remote audio is
-        // routed through Web Audio API in setupVolumeControl().
-        // This also ensures autoplay works on iOS Safari.
-        video.muted = true;
+        // The local tile must always be muted (it would echo). Remote tiles
+        // are muted only where audio is routed through Web Audio instead;
+        // on WebKit that path is silent, so the element itself plays.
+        video.muted = isLocal || this.useWebAudioOutput;
 
         const label = document.createElement('div');
         label.className = 'video-label';
@@ -753,8 +939,13 @@ class CallingApp {
         wrapper.appendChild(video);
         wrapper.appendChild(label);
 
-        // Tap/click toggles the per-tile controls overlay
+        // Tap/click toggles the per-tile controls overlay, and doubles as the
+        // gesture that recovers a tile whose autoplay was blocked.
         wrapper.addEventListener('click', () => {
+            if (video.paused) {
+                video.play().catch(() => { /* still blocked */ });
+                this.ensureAudioContext();
+            }
             const wasShowing = wrapper.classList.contains('show-controls');
             document.querySelectorAll('.video-wrapper.show-controls').forEach(w => {
                 w.classList.remove('show-controls');
@@ -788,15 +979,21 @@ class CallingApp {
             const volumeBtn = document.createElement('button');
             volumeBtn.className = 'volume-btn';
             volumeBtn.textContent = '🔊';
-            volumeBtn.title = 'Регулировка громкости';
-            volumeBtn.setAttribute('aria-label', 'Регулировка громкости участника');
+            volumeBtn.title = this.useWebAudioOutput ? 'Регулировка громкости' : 'Звук участника';
+            volumeBtn.setAttribute('aria-label', volumeBtn.title);
             volumeBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                this.showVolumeControl(clientId, volumeBtn);
+                if (this.useWebAudioOutput) {
+                    this.showVolumeControl(clientId, volumeBtn);
+                } else {
+                    // WebKit ignores element volume, so the only per-participant
+                    // control that actually works there is mute/unmute.
+                    this.toggleParticipantMute(clientId, volumeBtn);
+                }
             });
             wrapper.appendChild(volumeBtn);
 
-            // Add volume badge (shown on hover if volume != 100%)
+            // Add volume badge (shown when volume != 100%)
             const volumeBadge = document.createElement('div');
             volumeBadge.className = 'volume-badge';
             volumeBadge.id = `volume-badge-${clientId}`;
@@ -807,29 +1004,40 @@ class CallingApp {
             }
             wrapper.appendChild(volumeBadge);
 
-            // Setup audio routing through Web Audio API
             this.setupVolumeControl(clientId, video, stream);
         }
 
-        this.videosContainer.appendChild(wrapper);
+        // Spotlight and sidebar layouts feature the first tile, so remote
+        // participants go in front of the local one — nobody wants their own
+        // camera in the big slot with everyone else as thumbnails.
+        const localWrapper = this.videosContainer.querySelector('.video-wrapper.local-video');
+        if (!isLocal && localWrapper) {
+            this.videosContainer.insertBefore(wrapper, localWrapper);
+        } else {
+            this.videosContainer.appendChild(wrapper);
+        }
 
         // Update grid layout
         this.updateGridLayout();
 
-        // Try to play video
-        video.play().catch(e => console.log('Autoplay prevented:', e));
+        // Autoplay can be refused (iOS Low Power Mode blocks even muted
+        // video); the wrapper's click handler retries inside a user gesture.
+        video.play().catch(e => console.log('Autoplay prevented, tap the tile to start:', e));
+    }
+
+    _disconnectAudio(audioSetup) {
+        ['source', 'gainNode', 'limiter'].forEach((node) => {
+            try {
+                if (audioSetup[node]) audioSetup[node].disconnect();
+            } catch (e) { /* already disconnected */ }
+        });
     }
 
     removeVideoStream(clientId) {
         // Clean up audio context
         const audioSetup = this.audioContexts.get(clientId);
         if (audioSetup) {
-            try {
-                audioSetup.source.disconnect();
-                audioSetup.gainNode.disconnect();
-            } catch (e) {
-                console.log('Error disconnecting audio nodes:', e);
-            }
+            this._disconnectAudio(audioSetup);
             this.audioContexts.delete(clientId);
         }
 
@@ -850,10 +1058,11 @@ class CallingApp {
     }
 
     getEffectiveLayout(participantCount) {
+        // Alone in the room, every layout that reserves space for remote
+        // tiles just shows an empty container.
+        if (participantCount <= 1) return 'grid';
         if (this.layoutMode === 'auto') {
-            // Auto mode: smart selection based on participant count
-            if (participantCount <= 2) return 'grid';
-            return 'spotlight';
+            return participantCount <= 2 ? 'grid' : 'spotlight';
         }
         return this.layoutMode;
     }
@@ -904,6 +1113,10 @@ class CallingApp {
             pcConfig.encodedInsertableStreams = true;
         }
         const pc = new RTCPeerConnection(pcConfig);
+        // Offers and answers carry this id so a reply produced for a session
+        // we have since torn down can be recognised and ignored instead of
+        // being applied to — or silently dropped by — the replacement.
+        pc._sessionId = `${this.clientId}:${++this._sessionCounter}`;
         this.peerConnections.set(remoteClientId, pc);
 
         this.setupControlChannel(pc, remoteClientId);
@@ -1155,6 +1368,9 @@ class CallingApp {
     }
 
     async createOffer(remoteClientId, options) {
+        // ICE restarts renegotiate the existing connection; everything else
+        // starts a fresh one.
+        await this._configPromise;
         const pc = this.peerConnections.get(remoteClientId) && options && options.iceRestart
             ? this.peerConnections.get(remoteClientId)
             : this.createPeerConnection(remoteClientId);
@@ -1166,6 +1382,7 @@ class CallingApp {
             this._sendWs({
                 type: 'offer',
                 offer: pc.localDescription,
+                sessionId: pc._sessionId,
                 targetId: remoteClientId
             });
         } catch (error) {
@@ -1175,15 +1392,17 @@ class CallingApp {
 
     async handleOffer(message) {
         if (typeof message.senderId !== 'string' || !message.offer) return;
+        await this._configPromise;
+        this._clearNegotiationWatchdog(message.senderId);
 
         // Ensure we have local stream before creating peer connection
         if (!this.localStream) {
             try {
-                this.localStream = await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
+                await this.acquireLocalMedia();
                 this.addVideoStream(this.clientId, this.localStream, true);
             } catch (error) {
                 console.error('Error accessing media devices:', error);
-                this.showToast('Не удалось получить доступ к камере/микрофону');
+                this.showToast(this.mediaErrorMessage(error));
                 return;
             }
         }
@@ -1226,6 +1445,9 @@ class CallingApp {
             this._sendWs({
                 type: 'answer',
                 answer: pc.localDescription,
+                // Echo the offer's session id so the offerer can tell whether
+                // this answer belongs to the connection it still has open.
+                sessionId: message.sessionId,
                 targetId: message.senderId
             });
         } catch (error) {
@@ -1237,11 +1459,15 @@ class CallingApp {
         if (typeof message.senderId !== 'string' || !message.answer) return;
         try {
             const pc = this.peerConnections.get(message.senderId);
-            // Only apply an answer if we are actually waiting for one
-            if (pc && pc.signalingState === 'have-local-offer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(message.answer));
-                await this.processPendingIceCandidates(message.senderId);
+            if (!pc || pc.signalingState !== 'have-local-offer') return;
+            if (message.sessionId && pc._sessionId !== message.sessionId) {
+                // An answer to an offer from a connection we have replaced.
+                // Applying it would pair us with the wrong ICE/DTLS session.
+                console.warn('Ignoring answer for a stale session from', message.senderId);
+                return;
             }
+            await pc.setRemoteDescription(new RTCSessionDescription(message.answer));
+            await this.processPendingIceCandidates(message.senderId);
         } catch (error) {
             console.error('Error handling answer:', error);
         }
@@ -1250,20 +1476,24 @@ class CallingApp {
     async handleIceCandidate(message) {
         if (typeof message.senderId !== 'string' || !message.candidate) return;
         try {
+            const candidate = new RTCIceCandidate(message.candidate);
             const pc = this.peerConnections.get(message.senderId);
-            if (pc) {
-                const candidate = new RTCIceCandidate(message.candidate);
 
-                // Check if remote description is set
-                if (pc.remoteDescription) {
-                    await pc.addIceCandidate(candidate);
-                } else {
-                    // Buffer the candidate until remote description is set
-                    if (!this.pendingIceCandidates.has(message.senderId)) {
-                        this.pendingIceCandidates.set(message.senderId, []);
-                    }
-                    this.pendingIceCandidates.get(message.senderId).push(candidate);
-                }
+            if (pc && pc.remoteDescription) {
+                await pc.addIceCandidate(candidate);
+                return;
+            }
+
+            // No connection yet, or no remote description yet. Both are normal
+            // while we are still waiting on the camera permission prompt, and
+            // dropping these costs us the relay candidate on TURN-only paths.
+            let pending = this.pendingIceCandidates.get(message.senderId);
+            if (!pending) {
+                pending = [];
+                this.pendingIceCandidates.set(message.senderId, pending);
+            }
+            if (pending.length < MAX_PENDING_CANDIDATES) {
+                pending.push(candidate);
             }
         } catch (error) {
             console.error('Error adding ICE candidate:', error);
@@ -1295,6 +1525,7 @@ class CallingApp {
     // the peer is reconnecting and a fresh offer is on its way.
     _dropPeerSession(clientId) {
         this._clearIceRestartTimer(clientId);
+        this._clearNegotiationWatchdog(clientId);
         this._iceRestartAttempts.delete(clientId);
         const pc = this.peerConnections.get(clientId);
         if (pc) {
@@ -1366,6 +1597,7 @@ class CallingApp {
 
         // Clean up reconnection state
         this._clearIceRestartTimer(clientId);
+        this._clearNegotiationWatchdog(clientId);
         this._iceRestartAttempts.delete(clientId);
 
         // Close peer connection
@@ -1388,6 +1620,27 @@ class CallingApp {
 
         this.showToast('Участник покинул звонок');
         this.updateConnectionStatus(this.participantsLabel());
+        this.rotateEncryptionKey();
+    }
+
+    // Whoever owns the room key rotates it when somebody leaves, so a departed
+    // participant cannot decrypt anything sent after they were gone.
+    async rotateEncryptionKey() {
+        if (!this.frameCryptor.encryptionEnabled) return;
+        if (this.keyOwner !== this.clientId) return;
+        if (this.controlChannels.size === 0) return;
+
+        try {
+            await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
+            this.broadcastControl({
+                kind: 'e2ee-key',
+                key: Array.from(this.frameCryptor.rawKeyData),
+                owner: this.keyOwner
+            });
+            console.log('Encryption key rotated after a participant left');
+        } catch (error) {
+            console.error('Key rotation failed:', error);
+        }
     }
 
     toggleAudio() {
@@ -1617,10 +1870,17 @@ class CallingApp {
     ensureAudioContext() {
         if (!this.audioContext) {
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            // iOS moves the context to 'interrupted' on a phone call or Siri
+            // and never resumes it on its own — remote audio would stay silent
+            // for the rest of the call.
+            this.audioContext.addEventListener('statechange', () => {
+                if (this.audioContext.state !== 'running' && !document.hidden) {
+                    this.audioContext.resume().catch(() => { /* needs a gesture */ });
+                }
+            });
         }
-        // iOS Safari suspends AudioContext until resumed from a user gesture
-        if (this.audioContext.state === 'suspended') {
-            this.audioContext.resume();
+        if (this.audioContext.state !== 'running') {
+            this.audioContext.resume().catch(() => { /* needs a gesture */ });
         }
         return this.audioContext;
     }
@@ -1648,34 +1908,67 @@ class CallingApp {
     }
 
     setupVolumeControl(clientId, videoElement, stream) {
+        if (!this.useWebAudioOutput) {
+            // WebKit: the element is the audio sink. Web Audio would be silent
+            // here and would not throw, so there is nothing to fall back from.
+            videoElement.muted = false;
+            this.ensureAudioContext();
+            return;
+        }
+
         try {
             const audioContext = this.ensureAudioContext();
 
             // Mute the video element (we'll route audio through Web Audio API)
             videoElement.muted = true;
 
-            // Create audio nodes
             const source = audioContext.createMediaStreamSource(stream);
             const gainNode = audioContext.createGain();
+            // Boosting above 100% would otherwise hard-clip at the destination
+            const limiter = audioContext.createDynamicsCompressor();
+            limiter.threshold.value = -3;
+            limiter.knee.value = 0;
+            limiter.ratio.value = 20;
+            limiter.attack.value = 0.003;
+            limiter.release.value = 0.1;
 
-            // Set initial volume from saved settings
             const savedVolume = this.volumeSettings[clientId] || 1.0;
             gainNode.gain.value = savedVolume;
 
-            // Connect audio pipeline
             source.connect(gainNode);
-            gainNode.connect(audioContext.destination);
+            gainNode.connect(limiter);
+            limiter.connect(audioContext.destination);
 
-            // Store references
             this.audioContexts.set(clientId, {
                 context: audioContext,
                 source: source,
-                gainNode: gainNode
+                gainNode: gainNode,
+                limiter: limiter
             });
         } catch (error) {
             console.error('Error setting up volume control:', error);
             // Fallback: unmute video element
             videoElement.muted = false;
+        }
+    }
+
+    // WebKit ignores media-element volume, so per-participant control there is
+    // limited to muting.
+    toggleParticipantMute(clientId, buttonElement) {
+        const video = document.getElementById(`video-${clientId}`);
+        if (!video) return;
+        video.muted = !video.muted;
+        buttonElement.textContent = video.muted ? '🔇' : '🔊';
+        this.volumeSettings[clientId] = video.muted ? 0 : 1;
+
+        const badge = document.getElementById(`volume-badge-${clientId}`);
+        if (badge) {
+            badge.textContent = video.muted ? 'Без звука' : '';
+            badge.classList.toggle('visible', video.muted);
+        }
+        if (!video.muted) {
+            this.ensureAudioContext();
+            video.play().catch(() => { /* needs a gesture */ });
         }
     }
 
@@ -1733,10 +2026,12 @@ class CallingApp {
     }
 
     setParticipantVolume(clientId, volume) {
-        // Update volume in audio context
         const audioSetup = this.audioContexts.get(clientId);
         if (audioSetup && audioSetup.gainNode) {
-            audioSetup.gainNode.gain.value = volume;
+            // Ramp instead of assigning: a step change on every slider event
+            // is audible as zipper noise.
+            const ctx = audioSetup.context;
+            audioSetup.gainNode.gain.setTargetAtTime(volume, ctx.currentTime, 0.02);
         }
 
         // Remember for this call session
@@ -1781,6 +2076,8 @@ class CallingApp {
         this.pendingJoinRoomId = null;
         this._lastRequestedRoom = null;
         this._joining = false;
+        this._rejoining = false;
+        this._mediaPromise = null;
         this.participants.clear();
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
@@ -1838,12 +2135,19 @@ class CallingApp {
         const link = `${window.location.origin}?room=${encodeURIComponent(this.roomId)}`;
         const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent('Присоединяйтесь к звонку')}`;
 
-        // Try Telegram WebApp API first
+        // Available only when the page loads the Telegram Mini App SDK, which
+        // this build deliberately does not (see README: it would mean allowing
+        // a third-party script on a page that holds the E2EE key).
         if (window.Telegram && window.Telegram.WebApp) {
             window.Telegram.WebApp.openTelegramLink(shareUrl);
-        } else {
-            // Fallback to standard share URL
-            window.open(shareUrl, '_blank', 'noopener');
+            return;
+        }
+
+        // In-app webviews frequently refuse window.open; navigating away would
+        // end the call, so fall back to putting the link on the clipboard.
+        const opened = window.open(shareUrl, '_blank', 'noopener');
+        if (!opened) {
+            this.copyLink();
         }
     }
 

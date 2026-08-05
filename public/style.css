@@ -525,6 +525,26 @@ h1 {
     grid-column: 2;
 }
 
+/* On a phone a fixed 180px sidebar is wider than the "main" column, so the
+   thumbnails move to a strip under the featured tile instead. */
+@media (max-width: 768px) {
+    .videos-container[data-layout="sidebar"] {
+        grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+        grid-template-rows: 1fr auto;
+    }
+
+    .videos-container[data-layout="sidebar"] .video-wrapper:first-child {
+        grid-column: 1 / -1;
+        grid-row: 1;
+    }
+
+    .videos-container[data-layout="sidebar"] .video-wrapper:not(:first-child) {
+        grid-column: auto;
+        grid-row: 2;
+        max-height: 120px;
+    }
+}
+
 @media (min-width: 1024px) {
     .videos-container[data-layout="sidebar"] {
         grid-template-columns: 1fr 240px;
@@ -1129,6 +1149,7 @@ h1 {
     z-index: 9;
 }
 
-.video-wrapper:hover .volume-badge.visible {
+.video-wrapper:hover .volume-badge.visible,
+.video-wrapper.show-controls .volume-badge.visible {
     opacity: 1;
 }
