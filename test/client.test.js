@@ -440,6 +440,63 @@ test('remote tiles keep Web Audio routing on browsers where it works', async () 
   assert.ok(app.audioContexts.has('zzzz'));
 });
 
+test('an unreachable peer is eventually given up on instead of retried forever', async () => {
+  // A full reconnect resets the ICE-restart counter, so without a ceiling on
+  // rebuild cycles the pair loops for the whole call: constant teardown,
+  // repeated toasts, and a phone that just gets hot.
+  const env = createBrowser();
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+
+  for (let i = 0; i < app._maxPeerReconnects; i++) {
+    await app._reconnectPeer('zzzz');
+    assert.ok(app.peerConnections.has('zzzz'), `cycle ${i + 1} still rebuilds`);
+  }
+
+  await app._reconnectPeer('zzzz');
+  assert.strictEqual(app.peerConnections.has('zzzz'), false, 'we stop rebuilding');
+  assert.strictEqual(app.participants.get('zzzz').unreachable, true);
+  assert.match(env.document.getElementById('toast').textContent, /TURN/);
+});
+
+test('a peer that comes back gets a fresh recovery budget', async () => {
+  const env = createBrowser();
+  const { app, socket } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+
+  for (let i = 0; i <= app._maxPeerReconnects; i++) {
+    await app._reconnectPeer('zzzz');
+  }
+  assert.strictEqual(app.participants.get('zzzz').unreachable, true);
+
+  socket.deliver({ type: 'peer-joined', clientId: 'zzzz' });
+  await tick();
+
+  assert.strictEqual(app._peerReconnectAttempts.has('zzzz'), false);
+  assert.strictEqual(app.participants.get('zzzz').unreachable, undefined);
+});
+
+test('an ICE restart whose offer cannot be produced is retried, not dropped', async () => {
+  // The restart runs off a one-shot timer while the state is already 'failed',
+  // so nothing else would ever fire for this peer again.
+  const env = createBrowser();
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  await app.createOffer('zzzz');
+
+  const pc = app.peerConnections.get('zzzz');
+  pc.createOffer = () => Promise.reject(new Error('boom'));
+
+  const before = app._iceRestartAttempts.get('zzzz') || 0;
+  await app.createOffer('zzzz', { iceRestart: true });
+
+  assert.strictEqual(
+    app._iceRestartAttempts.get('zzzz'),
+    before + 1,
+    'the failure re-enters the retry ladder'
+  );
+});
+
 test('remote tiles are placed ahead of the local one so spotlight features a peer', async () => {
   const env = createBrowser();
   const { app } = await joinedApp(env, { clientId: 'aaaa' });

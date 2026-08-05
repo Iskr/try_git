@@ -805,6 +805,7 @@ class CallingApp {
         this._iceRestartTimers.forEach(timer => clearTimeout(timer));
         this._iceRestartTimers.clear();
         this._iceRestartAttempts.clear();
+        this._peerReconnectAttempts.clear();
         this._negotiationTimers.forEach(timer => clearTimeout(timer));
         this._negotiationTimers.clear();
 
@@ -1309,9 +1310,11 @@ class CallingApp {
             switch (pc.iceConnectionState) {
                 case 'connected':
                 case 'completed':
-                    // Reset ICE restart counter on success
+                    // Reset both recovery counters on success
                     this._iceRestartAttempts.delete(remoteClientId);
+                    this._peerReconnectAttempts.delete(remoteClientId);
                     this._clearIceRestartTimer(remoteClientId);
+                    this._markPeerReachable(remoteClientId);
                     this.updateConnectionStatus(this.participantsLabel(), true);
                     break;
                 case 'failed':
@@ -1540,7 +1543,7 @@ class CallingApp {
             const offer = await pc.createOffer(options);
             await pc.setLocalDescription(offer);
 
-            this._sendWs({
+            return this._sendWs({
                 type: 'offer',
                 offer: pc.localDescription,
                 sessionId: pc._sessionId,
@@ -1548,6 +1551,14 @@ class CallingApp {
             });
         } catch (error) {
             console.error('Error creating offer:', error);
+            // An ICE restart is driven by a one-shot timer, and the state is
+            // already 'failed', so no further event will arrive to retry this.
+            // Swallowing the error here would strand the peer for the rest of
+            // the call; re-entering the ladder keeps the attempt cap.
+            if (options && options.iceRestart) {
+                this._attemptIceRestart(remoteClientId);
+            }
+            return false;
         }
     }
 
@@ -1697,10 +1708,21 @@ class CallingApp {
     // Drops a peer's transport session (connection, data channel, buffered
     // candidates) but keeps the participant and its video tile — used when
     // the peer is reconnecting and a fresh offer is on its way.
+    _markPeerReachable(clientId) {
+        const participant = this.participants.get(clientId);
+        if (participant) delete participant.unreachable;
+        const wrapper = document.getElementById(`video-wrapper-${clientId}`);
+        if (wrapper) wrapper.classList.remove('unreachable');
+    }
+
     _dropPeerSession(clientId) {
         this._clearIceRestartTimer(clientId);
         this._clearNegotiationWatchdog(clientId);
         this._iceRestartAttempts.delete(clientId);
+        // The peer came back on a new connection — it has earned a fresh
+        // recovery budget, and is no longer known-unreachable.
+        this._peerReconnectAttempts.delete(clientId);
+        this._markPeerReachable(clientId);
         const pc = this.peerConnections.get(clientId);
         if (pc) {
             pc.close();
@@ -1738,6 +1760,33 @@ class CallingApp {
                 this.createOffer(clientId, { iceRestart: true });
             }
         }, delay));
+    }
+
+    // Recovery is exhausted for this peer. Stop rebuilding the connection and
+    // say so, instead of cycling forever: a peer we genuinely cannot route to
+    // (no TURN, symmetric NAT on both ends) will not become reachable by
+    // trying harder, and the churn costs mobile clients their battery.
+    _giveUpOnPeer(clientId) {
+        console.warn(`Giving up on peer ${clientId} — recovery exhausted`);
+        this._clearIceRestartTimer(clientId);
+        this._clearNegotiationWatchdog(clientId);
+        this._iceRestartAttempts.delete(clientId);
+
+        const pc = this.peerConnections.get(clientId);
+        if (pc) {
+            pc.close();
+            this.peerConnections.delete(clientId);
+        }
+        this.controlChannels.delete(clientId);
+        this.pendingIceCandidates.delete(clientId);
+
+        const participant = this.participants.get(clientId);
+        if (participant) participant.unreachable = true;
+        const wrapper = document.getElementById(`video-wrapper-${clientId}`);
+        if (wrapper) wrapper.classList.add('unreachable');
+
+        this.showToast('Не удалось соединиться с участником — возможно, нужен TURN-сервер');
+        this.updateConnectionStatus(this.participantsLabel(), false);
     }
 
     async _reconnectPeer(clientId) {
@@ -1780,6 +1829,7 @@ class CallingApp {
         this._clearIceRestartTimer(clientId);
         this._clearNegotiationWatchdog(clientId);
         this._iceRestartAttempts.delete(clientId);
+        this._peerReconnectAttempts.delete(clientId);
 
         // Close peer connection
         const pc = this.peerConnections.get(clientId);
