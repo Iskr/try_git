@@ -1,0 +1,257 @@
+// A jsdom page with just enough of the WebRTC / media / audio platform
+// stubbed out to drive public/app.js headlessly. The stubs record what the
+// app asked for so tests can assert on behaviour rather than on internals.
+const fs = require('fs');
+const path = require('path');
+const { webcrypto } = require('crypto');
+const { JSDOM } = require('jsdom');
+
+const PUBLIC_DIR = path.join(__dirname, '..', '..', 'public');
+
+function fakeTrack(kind) {
+  return {
+    kind,
+    enabled: true,
+    readyState: 'live',
+    stop() {
+      this.readyState = 'ended';
+    },
+  };
+}
+
+function fakeStream(kinds) {
+  const tracks = kinds.map(fakeTrack);
+  return {
+    id: `stream-${Math.random().toString(36).slice(2)}`,
+    getTracks: () => tracks,
+    getAudioTracks: () => tracks.filter((t) => t.kind === 'audio'),
+    getVideoTracks: () => tracks.filter((t) => t.kind === 'video'),
+  };
+}
+
+function createBrowser(options = {}) {
+  const html = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+  const dom = new JSDOM(html, {
+    url: 'http://localhost:3000/',
+    runScripts: 'outside-only',
+    pretendToBeVisual: true,
+  });
+  const { window } = dom;
+
+  const sent = [];
+  const sockets = [];
+
+  class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = FakeWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(data) {
+      this.sent.push(JSON.parse(data));
+      sent.push(JSON.parse(data));
+    }
+
+    close() {
+      if (this.readyState === FakeWebSocket.CLOSED) return;
+      this.readyState = FakeWebSocket.CLOSED;
+      if (this.onclose) this.onclose({});
+    }
+
+    // Test-side helpers
+    open() {
+      this.readyState = FakeWebSocket.OPEN;
+      if (this.onopen) this.onopen({});
+    }
+
+    deliver(message) {
+      if (this.onmessage) this.onmessage({ data: JSON.stringify(message) });
+    }
+  }
+  FakeWebSocket.CONNECTING = 0;
+  FakeWebSocket.OPEN = 1;
+  FakeWebSocket.CLOSING = 2;
+  FakeWebSocket.CLOSED = 3;
+
+  const peerConnections = [];
+
+  class FakeRTCPeerConnection {
+    constructor(config) {
+      this.config = config;
+      this.signalingState = 'stable';
+      this.connectionState = 'new';
+      this.iceConnectionState = 'new';
+      this.localDescription = null;
+      this.remoteDescription = null;
+      this.senders = [];
+      this.addedCandidates = [];
+      this.remoteDescriptionsApplied = [];
+      this.closed = false;
+      peerConnections.push(this);
+    }
+
+    createDataChannel() {
+      return { readyState: 'connecting', send() {}, close() {} };
+    }
+
+    addTrack(track) {
+      const sender = { track };
+      this.senders.push(sender);
+      return sender;
+    }
+
+    getTransceivers() {
+      return [];
+    }
+
+    async createOffer() {
+      return { type: 'offer', sdp: `offer-${this.senders.length}` };
+    }
+
+    async createAnswer() {
+      return { type: 'answer', sdp: 'answer' };
+    }
+
+    async setLocalDescription(description) {
+      if (description && description.type === 'rollback') {
+        this.signalingState = 'stable';
+        return;
+      }
+      this.localDescription = description;
+      this.signalingState = description.type === 'offer' ? 'have-local-offer' : 'stable';
+    }
+
+    async setRemoteDescription(description) {
+      this.remoteDescriptionsApplied.push(description);
+      this.remoteDescription = description;
+      this.signalingState = description.type === 'offer' ? 'have-remote-offer' : 'stable';
+    }
+
+    async addIceCandidate(candidate) {
+      this.addedCandidates.push(candidate);
+    }
+
+    close() {
+      this.closed = true;
+      this.connectionState = 'closed';
+    }
+  }
+
+  const audioNode = () => ({
+    connect() {},
+    disconnect() {},
+    gain: { value: 1, setTargetAtTime() {} },
+    threshold: { value: 0 },
+    knee: { value: 0 },
+    ratio: { value: 0 },
+    attack: { value: 0 },
+    release: { value: 0 },
+    frequency: { setValueAtTime() {}, exponentialRampToValueAtTime() {} },
+    start() {},
+    stop() {},
+  });
+
+  class FakeAudioContext {
+    constructor() {
+      this.state = 'running';
+      this.currentTime = 0;
+      this.destination = audioNode();
+    }
+    addEventListener() {}
+    resume() {
+      this.state = 'running';
+      return Promise.resolve();
+    }
+    createGain() {
+      return audioNode();
+    }
+    createDynamicsCompressor() {
+      return audioNode();
+    }
+    createMediaStreamSource() {
+      return audioNode();
+    }
+    createOscillator() {
+      return audioNode();
+    }
+  }
+
+  const media = {
+    calls: [],
+    // Default: a normal camera+mic device
+    handler: options.getUserMedia || (async (constraints) => fakeStream(constraints.video ? ['audio', 'video'] : ['audio'])),
+  };
+
+  window.WebSocket = FakeWebSocket;
+  window.RTCPeerConnection = FakeRTCPeerConnection;
+  window.RTCSessionDescription = function (description) {
+    return description;
+  };
+  window.RTCIceCandidate = function (candidate) {
+    return candidate;
+  };
+  window.AudioContext = FakeAudioContext;
+  window.crypto = webcrypto;
+  window.HTMLMediaElement.prototype.play = () => Promise.resolve();
+  window.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      iceServers: [{ urls: ['stun:stun.example:3478'] }],
+      maxParticipants: 5,
+    }),
+  });
+  window.navigator.mediaDevices = {
+    getUserMedia: (constraints) => {
+      media.calls.push(constraints);
+      return media.handler(constraints);
+    },
+  };
+
+  // Drop app.js's own bootstrap: jsdom fires DOMContentLoaded a tick after
+  // construction, which would spawn an app instance the tests never asked for.
+  const source = fs.readFileSync(path.join(PUBLIC_DIR, 'app.js'), 'utf8');
+  const bootstrap = /\/\/ Initialize app when DOM is ready[\s\S]*$/;
+  if (!bootstrap.test(source)) {
+    throw new Error('app.js bootstrap block not found — update test/helpers/browser-env.js');
+  }
+
+  // Class declarations inside an indirect eval stay in that eval's scope, so
+  // the constructor has to be handed out explicitly.
+  window.eval(`${source.replace(bootstrap, '')}\n;window.__CallingApp = CallingApp;`);
+  const CallingApp = window.__CallingApp;
+
+  return {
+    dom,
+    window,
+    document: window.document,
+    CallingApp,
+    media,
+    sockets,
+    peerConnections,
+    fakeStream,
+    lastSocket: () => sockets[sockets.length - 1],
+  };
+}
+
+// Drives an app instance from construction to "in a call", the state most
+// behaviour under test depends on.
+async function joinedApp(env, { clientId = 'client-b', participants = [] } = {}) {
+  const app = new env.CallingApp();
+  const socket = env.lastSocket();
+  socket.open();
+  app.joinRoom('ROOM01');
+  socket.deliver({
+    type: 'joined',
+    roomId: 'ROOM01',
+    clientId,
+    participants,
+    resumeToken: 'a'.repeat(64),
+  });
+  // Let handleJoined's awaits (config fetch, getUserMedia) settle
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  return { app, socket };
+}
+
+module.exports = { createBrowser, joinedApp, fakeStream };
