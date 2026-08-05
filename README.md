@@ -291,6 +291,9 @@ pm2 save
 | `TURN_USERNAME` / `TURN_PASSWORD` | — | Статические TURN-креденшелы |
 | `TURN_STATIC_AUTH_SECRET` | — | Секрет coturn `use-auth-secret`: вместо статических выдаются временные креденшелы |
 | `TURN_CREDENTIAL_TTL_SECONDS` | `21600` | Срок жизни временных TURN-креденшелов |
+| `CLOUDFLARE_TURN_KEY_ID` | — | ID TURN-ключа Cloudflare (managed TURN вместо своего сервера) |
+| `CLOUDFLARE_TURN_API_TOKEN` | — | Токен к нему; креды выпускаются через их API и кешируются |
+| `CLOUDFLARE_TURN_TTL_SECONDS` | `21600` | Срок жизни кредов Cloudflare |
 | `LOG_LEVEL` | `info` | `silent`/`error`/`warn`/`info`/`debug`; события отдельных клиентов — на `debug` |
 
 ## 🤖 Интеграция с Telegram Bot
@@ -439,6 +442,28 @@ TURN_SERVER_URL=turn:your-turn-server.com:3478,turns:your-turn-server.com:443?tr
 TURN_USERNAME=your-username
 TURN_PASSWORD=your-password
 ```
+
+### TURN без собственного сервера
+
+Если держать свой coturn не хочется, задайте managed TURN от Cloudflare:
+
+```bash
+CLOUDFLARE_TURN_KEY_ID=<из панели Cloudflare>
+CLOUDFLARE_TURN_API_TOKEN=<токен этого ключа>
+```
+
+Приложение само сходит к их API за временными кредами и закеширует их. Кеш
+здесь не оптимизация, а необходимость: `/config` открыт всем, и без кеша
+достаточно обновлять страницу в цикле, чтобы израсходовать квоту API аккаунта.
+Если их API недоступен, отдаются последние удачные креды, а при их отсутствии
+конфиг просто приходит без TURN — но не ломается.
+
+Свой TURN и Cloudflare можно включить одновременно: клиент получит оба, а
+больше кандидатов — больше шансов, что звонок соединится.
+
+**Публичные бесплатные релеи не работают.** `openrelay.metered.ca` не отвечает
+ни по UDP, ни по TCP (проверено запросом Allocate) — прописывать его
+бессмысленно.
 
 ### Настройка максимального числа участников
 

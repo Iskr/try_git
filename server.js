@@ -157,9 +157,93 @@ function turnCredentials() {
   return { username, credential };
 }
 
+// Cloudflare's managed TURN, for deployments without a relay of their own.
+// Credentials are minted by their API rather than derived locally, so the
+// result is cached: /config is public, and without a cache anyone could spend
+// the account's API quota by refreshing the page.
+const CLOUDFLARE_TURN_KEY_ID = process.env.CLOUDFLARE_TURN_KEY_ID;
+const CLOUDFLARE_TURN_API_TOKEN = process.env.CLOUDFLARE_TURN_API_TOKEN;
+const CLOUDFLARE_TURN_TTL_SECONDS = intFromEnv('CLOUDFLARE_TURN_TTL_SECONDS', 6 * 3600, 600);
+// How long a failure is remembered, so an outage at their end does not turn
+// into one request per visitor.
+const CLOUDFLARE_TURN_ERROR_BACKOFF_MS = 60000;
+
+const cloudflareTurn = { entry: null, expiresAt: 0, failedUntil: 0, inflight: null };
+
+// Their API has returned the credentials under slightly different shapes over
+// time; accept any of them rather than silently serving a call with no relay.
+function normalizeCloudflareResponse(body) {
+  const raw = body && (body.iceServers || body.ice_servers);
+  if (!raw) return null;
+  const list = Array.isArray(raw) ? raw : [raw];
+  const entry = list.find((s) => s && s.urls && s.username && s.credential);
+  if (!entry) return null;
+  return {
+    urls: Array.isArray(entry.urls) ? entry.urls : [entry.urls],
+    username: entry.username,
+    credential: entry.credential,
+  };
+}
+
+async function cloudflareIceServer() {
+  if (!CLOUDFLARE_TURN_KEY_ID || !CLOUDFLARE_TURN_API_TOKEN) {
+    return null;
+  }
+  const now = Date.now();
+  if (cloudflareTurn.entry && now < cloudflareTurn.expiresAt) {
+    return cloudflareTurn.entry;
+  }
+  if (now < cloudflareTurn.failedUntil) {
+    return cloudflareTurn.entry;
+  }
+  // Coalesce: a burst of joins must produce one API call, not one each.
+  if (cloudflareTurn.inflight) {
+    return cloudflareTurn.inflight;
+  }
+
+  cloudflareTurn.inflight = (async () => {
+    try {
+      const res = await fetch(
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(CLOUDFLARE_TURN_KEY_ID)}/credentials/generate`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${CLOUDFLARE_TURN_API_TOKEN}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ ttl: CLOUDFLARE_TURN_TTL_SECONDS }),
+          signal: AbortSignal.timeout(5000),
+        }
+      );
+      if (!res.ok) {
+        throw new Error(`Cloudflare TURN API returned ${res.status}`);
+      }
+      const entry = normalizeCloudflareResponse(await res.json());
+      if (!entry) {
+        throw new Error('Cloudflare TURN API returned an unrecognised body');
+      }
+      cloudflareTurn.entry = entry;
+      // Refresh early so a call never starts on credentials about to expire
+      cloudflareTurn.expiresAt = Date.now() + Math.max(60, CLOUDFLARE_TURN_TTL_SECONDS * 0.8) * 1000;
+      cloudflareTurn.failedUntil = 0;
+      return entry;
+    } catch (error) {
+      logWarn('Could not fetch Cloudflare TURN credentials:', error.message);
+      cloudflareTurn.failedUntil = Date.now() + CLOUDFLARE_TURN_ERROR_BACKOFF_MS;
+      // Keep serving the previous credentials if we have any — stale relays
+      // beat no relay.
+      return cloudflareTurn.entry;
+    } finally {
+      cloudflareTurn.inflight = null;
+    }
+  })();
+
+  return cloudflareTurn.inflight;
+}
+
 // ICE servers are handed to clients from here so TURN credentials live in
 // environment variables instead of being hardcoded in the frontend.
-app.get('/config', (req, res) => {
+app.get('/config', async (req, res) => {
   const iceServers = [];
 
   const stunUrls = (process.env.STUN_URLS || 'stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302')
@@ -175,6 +259,17 @@ app.get('/config', (req, res) => {
       urls: process.env.TURN_SERVER_URL.split(',').map((u) => u.trim()).filter(Boolean),
       ...turnCredentials(),
     });
+  }
+
+  // Both can be configured at once: more candidate paths, more calls that
+  // connect. A failure here must never take /config down with it.
+  try {
+    const cloudflare = await cloudflareIceServer();
+    if (cloudflare) {
+      iceServers.push(cloudflare);
+    }
+  } catch (error) {
+    logWarn('Cloudflare TURN lookup failed:', error.message);
   }
 
   // Credentials must never sit in a shared cache
@@ -649,6 +744,15 @@ module.exports = {
   wss,
   rooms,
   stop,
+  __testing: {
+    normalizeCloudflareResponse,
+    resetCloudflareCache(keepEntry) {
+      if (!keepEntry) cloudflareTurn.entry = null;
+      cloudflareTurn.expiresAt = 0;
+      cloudflareTurn.failedUntil = 0;
+      cloudflareTurn.inflight = null;
+    },
+  },
   config: {
     MAX_PARTICIPANTS,
     MAX_ROOMS,
