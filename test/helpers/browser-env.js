@@ -193,7 +193,14 @@ function createBrowser(options = {}) {
     return candidate;
   };
   window.AudioContext = FakeAudioContext;
-  window.crypto = webcrypto;
+  // jsdom exposes crypto as a read-only accessor and ships no subtle
+  Object.defineProperty(window, 'crypto', { value: webcrypto, configurable: true });
+  if (options.frameEncryption) {
+    // Presence of this constructor is what FrameCryptor feature-detects. The
+    // transforms are only installed on real senders/receivers, so the key
+    // handling under test runs without needing a Worker.
+    window.RTCRtpScriptTransform = function RTCRtpScriptTransform() {};
+  }
   window.HTMLMediaElement.prototype.play = () => Promise.resolve();
   window.fetch = async () => ({
     ok: true,
