@@ -109,6 +109,44 @@ test('a capture that lands after hang-up does not leave the camera running', asy
   );
 });
 
+test('hanging up during the permission prompt does not throw or half-open a call', async () => {
+  // Discarding the stale capture leaves localStream null, so everything that
+  // resumes after the await has to notice the call is gone rather than
+  // dereference it.
+  let releaseCapture;
+  const env = createBrowser({
+    getUserMedia: () => new Promise((resolve) => { releaseCapture = () => resolve(fakeStream(['audio', 'video'])); }),
+  });
+  const errors = [];
+  env.window.addEventListener('error', (e) => errors.push(e.message));
+
+  const app = new env.CallingApp();
+  const socket = env.lastSocket();
+  socket.open();
+  app.joinRoom('ROOM01');
+  socket.deliver({
+    type: 'joined',
+    roomId: 'ROOM01',
+    clientId: 'aaaa',
+    participants: [],
+    resumeToken: 'a'.repeat(64),
+  });
+  await tick();
+
+  app.endCall();
+  releaseCapture();
+  await tick(50);
+
+  assert.deepStrictEqual(errors, [], 'no uncaught error escapes handleJoined');
+  assert.strictEqual(app.roomId, null);
+  assert.strictEqual(app.localStream, null);
+  assert.strictEqual(
+    env.document.getElementById('call-screen').classList.contains('active'),
+    false,
+    'the call screen must not come back after hang-up'
+  );
+});
+
 test('a throttled rejoin is retried instead of ending the call', async () => {
   const env = createBrowser();
   const { app, socket } = await joinedApp(env, { clientId: 'aaaa' });
