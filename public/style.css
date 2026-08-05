@@ -51,6 +51,7 @@ body {
     -moz-osx-font-smoothing: grayscale;
     overflow: hidden;
     height: 100vh;
+    height: 100dvh;
     background-image:
         radial-gradient(at 40% 20%, rgba(102, 126, 234, 0.1) 0px, transparent 50%),
         radial-gradient(at 80% 80%, rgba(118, 75, 162, 0.1) 0px, transparent 50%);
@@ -60,6 +61,7 @@ body {
     width: 100%;
     margin: 0 auto;
     height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
 }
@@ -270,6 +272,7 @@ h1 {
 .call-info {
     padding: 20px;
     background: var(--surface-color);
+    -webkit-backdrop-filter: blur(10px);
     backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--border-color);
     box-shadow: var(--shadow-sm);
@@ -522,6 +525,26 @@ h1 {
     grid-column: 2;
 }
 
+/* On a phone a fixed 180px sidebar is wider than the "main" column, so the
+   thumbnails move to a strip under the featured tile instead. */
+@media (max-width: 768px) {
+    .videos-container[data-layout="sidebar"] {
+        grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+        grid-template-rows: 1fr auto;
+    }
+
+    .videos-container[data-layout="sidebar"] .video-wrapper:first-child {
+        grid-column: 1 / -1;
+        grid-row: 1;
+    }
+
+    .videos-container[data-layout="sidebar"] .video-wrapper:not(:first-child) {
+        grid-column: auto;
+        grid-row: 2;
+        max-height: 120px;
+    }
+}
+
 @media (min-width: 1024px) {
     .videos-container[data-layout="sidebar"] {
         grid-template-columns: 1fr 240px;
@@ -533,6 +556,59 @@ h1 {
     .videos-container[data-layout="sidebar"] {
         grid-template-columns: 1fr 300px;
         grid-template-rows: repeat(auto-fill, minmax(200px, 1fr));
+    }
+}
+
+/* COMPACT MODE - local video small in corner, remote participants fill the space */
+.videos-container[data-layout="compact"] {
+    position: relative;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+}
+
+.videos-container[data-layout="compact"][data-participants="2"] {
+    grid-template-columns: 1fr;
+}
+
+.videos-container[data-layout="compact"][data-participants="3"],
+.videos-container[data-layout="compact"][data-participants="4"] {
+    grid-template-columns: repeat(2, 1fr);
+}
+
+.videos-container[data-layout="compact"] .video-wrapper.local-video {
+    position: absolute;
+    bottom: 16px;
+    right: 16px;
+    width: 160px;
+    height: 120px;
+    z-index: 20;
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-lg);
+    border-width: 1px;
+}
+
+.videos-container[data-layout="compact"] .video-wrapper.local-video:hover {
+    transform: scale(1.05);
+}
+
+@media (max-width: 768px) {
+    .videos-container[data-layout="compact"] .video-wrapper.local-video {
+        width: 120px;
+        height: 90px;
+        bottom: 12px;
+        right: 12px;
+    }
+
+    .videos-container[data-layout="compact"][data-participants="3"],
+    .videos-container[data-layout="compact"][data-participants="4"] {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (min-width: 1024px) {
+    .videos-container[data-layout="compact"] .video-wrapper.local-video {
+        width: 200px;
+        height: 150px;
     }
 }
 
@@ -563,11 +639,55 @@ h1 {
     border: 2px solid var(--primary-color);
 }
 
+.video-wrapper.local-video.mirrored video {
+    transform: scaleX(-1);
+}
+
+.mirror-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.6);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: white;
+    cursor: pointer;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+    z-index: 10;
+    padding: 0;
+}
+
+.video-wrapper.local-video.show-controls .mirror-btn {
+    display: flex;
+}
+
+.mirror-btn:hover {
+    background: rgba(0, 0, 0, 0.8);
+    transform: scale(1.1);
+}
+
+.mirror-btn.active {
+    background: var(--primary-color);
+}
+
+.mirror-btn svg {
+    width: 16px;
+    height: 16px;
+}
+
 .video-label {
     position: absolute;
     bottom: 12px;
     left: 12px;
     background: rgba(0, 0, 0, 0.7);
+    -webkit-backdrop-filter: blur(10px);
     backdrop-filter: blur(10px);
     color: white;
     padding: 6px 12px;
@@ -584,6 +704,18 @@ h1 {
     font-size: 12px;
 }
 
+/* A peer we ran out of ways to reach — say so instead of showing a tile that
+   looks like it is merely still connecting. */
+.video-wrapper.unreachable video {
+    opacity: 0.35;
+    filter: grayscale(1);
+}
+
+.video-wrapper.unreachable .video-label::before {
+    content: '⚠ нет связи · ';
+    color: var(--warning-color);
+}
+
 
 .controls {
     display: flex;
@@ -592,6 +724,7 @@ h1 {
     gap: 20px;
     padding: 28px;
     background: var(--surface-color);
+    -webkit-backdrop-filter: blur(10px);
     backdrop-filter: blur(10px);
     box-shadow: var(--shadow-md);
 }
@@ -878,8 +1011,10 @@ h1 {
     right: 8px;
     width: 32px;
     height: 32px;
+    padding: 0;
     border-radius: 50%;
     background: rgba(0, 0, 0, 0.6);
+    -webkit-backdrop-filter: blur(10px);
     backdrop-filter: blur(10px);
     border: 1px solid rgba(255, 255, 255, 0.1);
     color: white;
@@ -1013,6 +1148,7 @@ h1 {
     top: 8px;
     left: 8px;
     background: rgba(0, 0, 0, 0.6);
+    -webkit-backdrop-filter: blur(10px);
     backdrop-filter: blur(10px);
     color: white;
     font-size: 11px;
@@ -1025,6 +1161,7 @@ h1 {
     z-index: 9;
 }
 
-.video-wrapper:hover .volume-badge.visible {
+.video-wrapper:hover .volume-badge.visible,
+.video-wrapper.show-controls .volume-badge.visible {
     opacity: 1;
 }

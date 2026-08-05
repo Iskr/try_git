@@ -1,10 +1,22 @@
 services:
   - type: web
     name: calling-service
-    env: node
-    buildCommand: npm install
+    runtime: node
+    buildCommand: npm ci --omit=dev
     startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+      # Render terminates TLS one hop in front of the app. This drives both
+      # HSTS and the client IP the per-IP limits are keyed on.
+      - key: TRUST_PROXY
+        value: "1"
+      # TURN. `sync: false` means "this service needs the variable, but its
+      # value lives in the dashboard, not in this file" — nothing sensitive
+      # is committed, and Render prompts for it instead of silently starting
+      # without a relay.
+      - key: TURN_SERVER_URL
+        sync: false
+      - key: TURN_STATIC_AUTH_SECRET
+        sync: false
