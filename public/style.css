@@ -704,6 +704,18 @@ h1 {
     font-size: 12px;
 }
 
+/* A peer we ran out of ways to reach — say so instead of showing a tile that
+   looks like it is merely still connecting. */
+.video-wrapper.unreachable video {
+    opacity: 0.35;
+    filter: grayscale(1);
+}
+
+.video-wrapper.unreachable .video-label::before {
+    content: '⚠ нет связи · ';
+    color: var(--warning-color);
+}
+
 
 .controls {
     display: flex;
