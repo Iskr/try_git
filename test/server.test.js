@@ -1,28 +1,34 @@
+// The whole suite shares one source IP, so the per-IP room-probe throttle
+// would fire on the sheer number of distinct rooms used here. It is exercised
+// on purpose in test/limits.test.js, which runs in its own process.
+process.env.MAX_ROOMS_PER_IP_PER_MINUTE = '1000';
+
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
 const WebSocket = require('ws');
 
-const { server, rooms } = require('../server');
+const { server, rooms, stop } = require('../server');
 
 let baseUrl;
 let wsUrl;
+let maxParticipants;
 
 before(async () => {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   baseUrl = `http://127.0.0.1:${port}`;
   wsUrl = `ws://127.0.0.1:${port}`;
+  const config = await (await fetch(`${baseUrl}/config`)).json();
+  maxParticipants = config.maxParticipants;
 });
 
-after(() => {
-  server.close();
-  // ws keeps the process alive via open handles; force-exit timers
-  setImmediate(() => process.exit(0)).unref?.();
+after(async () => {
+  await stop();
 });
 
-function connect() {
+function connect(options) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(wsUrl, options);
     const messages = [];
     const waiters = [];
     ws.on('message', (raw) => {
@@ -65,6 +71,12 @@ function join(client, roomId) {
   return nextMessage(client, 'joined');
 }
 
+function closed(client) {
+  return new Promise((resolve) => client.ws.on('close', (code) => resolve(code)));
+}
+
+const settle = (ms = 200) => new Promise((r) => setTimeout(r, ms));
+
 test('GET /health reports ok', async () => {
   const res = await fetch(`${baseUrl}/health`);
   assert.strictEqual(res.status, 200);
@@ -81,11 +93,44 @@ test('GET /config returns ICE servers and participant limit', async () => {
   assert.ok(Number.isInteger(body.maxParticipants));
 });
 
+test('GET /config is never cached — it may carry TURN credentials', async () => {
+  const res = await fetch(`${baseUrl}/config`);
+  assert.strictEqual(res.headers.get('cache-control'), 'no-store');
+});
+
+test('/config issues ephemeral TURN credentials when a static auth secret is set', async () => {
+  process.env.TURN_SERVER_URL = 'turn:turn.example:3478';
+  process.env.TURN_STATIC_AUTH_SECRET = 'test-secret';
+  try {
+    const body = await (await fetch(`${baseUrl}/config`)).json();
+    const turn = body.iceServers.find((s) => String(s.urls).includes('turn:'));
+    assert.ok(turn, 'TURN server should be advertised');
+    const [expiry] = turn.username.split(':');
+    assert.ok(Number(expiry) > Math.floor(Date.now() / 1000), 'username encodes a future expiry');
+    assert.ok(turn.credential.length > 0);
+    assert.notStrictEqual(turn.credential, 'test-secret');
+  } finally {
+    delete process.env.TURN_SERVER_URL;
+    delete process.env.TURN_STATIC_AUTH_SECRET;
+  }
+});
+
 test('responses carry security headers', async () => {
   const res = await fetch(`${baseUrl}/health`);
-  assert.ok(res.headers.get('content-security-policy').includes("default-src 'self'"));
+  const csp = res.headers.get('content-security-policy');
+  assert.ok(csp.includes("default-src 'self'"));
+  // Bare ws:/wss: scheme sources would allow exfiltration to any host
+  assert.ok(!/connect-src[^;]*\swss:(\s|;|$)/.test(csp), `connect-src too broad: ${csp}`);
+  assert.ok(csp.includes(`wss://127.0.0.1`));
   assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
   assert.strictEqual(res.headers.get('x-powered-by'), null);
+});
+
+test('static assets are revalidated so a deploy cannot leave a stale client', async () => {
+  const res = await fetch(`${baseUrl}/app.js`);
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.headers.get('cache-control'), 'no-cache');
+  assert.ok(res.headers.get('etag'), 'ETag is what makes no-cache cheap');
 });
 
 test('join with a valid room id succeeds and returns a resume token', async () => {
@@ -140,6 +185,26 @@ test('second participant is announced and listed', async () => {
   b.ws.close();
 });
 
+test('re-joining the room you already occupy does not re-announce you to peers', async () => {
+  // Peers treat peer-joined for a known id as "reconnected" and tear their
+  // session down, so a member could otherwise force endless renegotiation.
+  const a = await connect();
+  const b = await connect();
+  await join(a, 'IDEM01');
+  const joinedB = await join(b, 'IDEM01');
+  await nextMessage(a, 'peer-joined');
+
+  const second = await join(b, 'IDEM01');
+  assert.strictEqual(second.clientId, joinedB.clientId);
+  assert.deepStrictEqual(second.participants.length, 1);
+
+  await settle();
+  assert.strictEqual(a.messages.filter((m) => m.type === 'peer-joined').length, 0);
+
+  a.ws.close();
+  b.ws.close();
+});
+
 test('signaling is relayed only to the target with a server-set senderId', async () => {
   const a = await connect();
   const b = await connect();
@@ -169,16 +234,42 @@ test('signaling to clients in other rooms is not possible', async () => {
   const joinedB = await join(b, 'ROOM04');
 
   send(a, { type: 'offer', offer: {}, targetId: joinedB.clientId });
-  await new Promise((r) => setTimeout(r, 200));
+  await settle();
   assert.strictEqual(b.messages.filter((m) => m.type === 'offer').length, 0);
 
   a.ws.close();
   b.ws.close();
 });
 
-test('room is limited to MAX_PARTICIPANTS', async () => {
+test('signaling before joining any room is dropped', async () => {
+  const a = await connect();
+  const b = await connect();
+  const joinedB = await join(b, 'NOJOIN');
+
+  send(a, { type: 'offer', offer: {}, targetId: joinedB.clientId });
+  await settle();
+  assert.strictEqual(b.messages.filter((m) => m.type === 'offer').length, 0);
+
+  // ...and the connection is still usable
+  const joined = await join(a, 'NOJOIN');
+  assert.strictEqual(joined.roomId, 'NOJOIN');
+
+  a.ws.close();
+  b.ws.close();
+});
+
+test('a client cannot relay signaling to itself', async () => {
+  const a = await connect();
+  const joinedA = await join(a, 'SELF01');
+  send(a, { type: 'offer', offer: {}, targetId: joinedA.clientId });
+  await settle();
+  assert.strictEqual(a.messages.filter((m) => m.type === 'offer').length, 0);
+  a.ws.close();
+});
+
+test('room is limited to MAX_PARTICIPANTS and a leave frees the slot', async () => {
   const clients = [];
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < maxParticipants; i++) {
     const client = await connect();
     await join(client, 'FULL01');
     clients.push(client);
@@ -188,6 +279,13 @@ test('room is limited to MAX_PARTICIPANTS', async () => {
   send(extra, { type: 'join', roomId: 'FULL01' });
   const full = await nextMessage(extra, 'room-full');
   assert.strictEqual(full.roomId, 'FULL01');
+  assert.strictEqual(full.maxParticipants, maxParticipants);
+
+  // Freeing a seat lets the waiting client in
+  clients.pop().ws.close();
+  await settle();
+  const joined = await join(extra, 'FULL01');
+  assert.strictEqual(joined.roomId, 'FULL01');
 
   clients.forEach((c) => c.ws.close());
   extra.ws.close();
@@ -207,7 +305,7 @@ test('leave notifies peers and empties the room', async () => {
   b.ws.close();
   a.ws.close();
   // Room cleanup happens after the close frame is processed
-  await new Promise((r) => setTimeout(r, 200));
+  await settle();
   assert.strictEqual(rooms.has('ROOM05'), false);
 });
 
@@ -227,7 +325,7 @@ test('rejoin with a valid resume token keeps the clientId', async () => {
   const a = await connect();
   const joinedA = await join(a, 'ROOM07');
   a.ws.close();
-  await new Promise((r) => setTimeout(r, 100));
+  await settle(100);
 
   const b = await connect();
   send(b, {
@@ -259,6 +357,61 @@ test('rejoin with a forged resume token gets a fresh identity', async () => {
   b.ws.close();
 });
 
+test('switching identity via rejoin while in a room does not orphan the old entry', async () => {
+  // Resume tokens are unexpiring HMACs handed to every client, so a member can
+  // obtain a token for a second identity and rejoin under it. If the seat held
+  // by the first identity is not vacated, the room keeps a dead entry forever:
+  // the slot is burned and the room is never garbage-collected.
+  const donor = await connect();
+  const donated = await join(donor, 'DONOR1');
+  donor.ws.close();
+  await settle(100);
+
+  const client = await connect();
+  await join(client, 'SWAP01');
+  send(client, {
+    type: 'rejoin',
+    roomId: 'SWAP01',
+    clientId: donated.clientId,
+    resumeToken: donated.resumeToken,
+  });
+  const rejoined = await nextMessage(client, 'joined');
+  assert.strictEqual(rejoined.clientId, donated.clientId);
+  assert.strictEqual(rooms.get('SWAP01').size, 1, 'the abandoned identity must be gone');
+
+  client.ws.close();
+  await settle();
+  assert.strictEqual(rooms.has('SWAP01'), false, 'room must be collected once empty');
+});
+
+test('peers are told when a member abandons its identity mid-call', async () => {
+  const donor = await connect();
+  const donated = await join(donor, 'DONOR2');
+  donor.ws.close();
+  await settle(100);
+
+  const a = await connect();
+  const b = await connect();
+  const joinedA = await join(a, 'SWAP02');
+  await join(b, 'SWAP02');
+  await nextMessage(a, 'peer-joined');
+
+  send(a, {
+    type: 'rejoin',
+    roomId: 'SWAP02',
+    clientId: donated.clientId,
+    resumeToken: donated.resumeToken,
+  });
+
+  const left = await nextMessage(b, 'peer-left');
+  assert.strictEqual(left.clientId, joinedA.clientId);
+  const rejoinedAnnounce = await nextMessage(b, 'peer-joined');
+  assert.strictEqual(rejoinedAnnounce.clientId, donated.clientId);
+
+  a.ws.close();
+  b.ws.close();
+});
+
 test('application-level ping gets a pong', async () => {
   const client = await connect();
   send(client, { type: 'ping' });
@@ -275,11 +428,33 @@ test('unknown message types are ignored without breaking the connection', async 
   client.ws.close();
 });
 
-test('message flood closes the connection', async () => {
+test('message flood closes the connection with a policy-violation code', async () => {
   const client = await connect();
-  const closed = new Promise((resolve) => client.ws.on('close', resolve));
+  const code = closed(client);
   for (let i = 0; i < 400; i++) {
     send(client, { type: 'ping' });
   }
-  await closed;
+  assert.strictEqual(await code, 1008);
+});
+
+test('oversize frames are rejected by the server', async () => {
+  const client = await connect();
+  const code = closed(client);
+  client.ws.send(JSON.stringify({ type: 'ping', pad: 'x'.repeat(128 * 1024) }));
+  assert.strictEqual(await code, 1009);
+});
+
+test('WebSocket upgrades from a foreign origin are refused', async () => {
+  await assert.rejects(
+    () => connect({ origin: 'https://evil.example' }),
+    /403|Unexpected server response/
+  );
+});
+
+test('WebSocket upgrades from the page origin are accepted', async () => {
+  const { port } = server.address();
+  const client = await connect({ origin: `http://127.0.0.1:${port}` });
+  const joined = await join(client, 'ORIG01');
+  assert.strictEqual(joined.roomId, 'ORIG01');
+  client.ws.close();
 });
