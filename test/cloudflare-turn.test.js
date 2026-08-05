@@ -41,12 +41,16 @@ function jsonResponse(body, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
 
+// The documented shape of POST .../credentials/generate-ice-servers
 const CREDENTIALS = {
-  iceServers: {
-    urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turns:turn.cloudflare.com:443?transport=tcp'],
-    username: 'cf-user',
-    credential: 'cf-secret',
-  },
+  iceServers: [
+    { urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.cloudflare.com:53'] },
+    {
+      urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turns:turn.cloudflare.com:443?transport=tcp'],
+      username: 'cf-user',
+      credential: 'cf-secret',
+    },
+  ],
 };
 
 function turnEntries(body) {
@@ -66,6 +70,13 @@ test('credentials from the API are served to clients', async () => {
   assert.strictEqual(sent.ttl, 600);
   assert.strictEqual(calls[0].options.headers.Authorization, 'Bearer test-token');
   assert.ok(calls[0].url.includes('test-key-id'));
+  assert.ok(
+    calls[0].url.endsWith('/credentials/generate-ice-servers'),
+    `wrong endpoint: ${calls[0].url}`
+  );
+
+  // Their STUN comes along too — port 53 gets through networks that block 3478
+  assert.ok(body.iceServers.some((s) => String(s.urls).includes('stun.cloudflare.com:53')));
 });
 
 test('repeated requests reuse one set of credentials', async () => {
@@ -145,17 +156,27 @@ test('an unrecognised response shape is rejected rather than served', async () =
 
 test('both documented response shapes are understood', async () => {
   const { __testing } = require('../server');
-  const flat = __testing.normalizeCloudflareResponse(CREDENTIALS);
-  assert.deepStrictEqual(flat.urls.length, 2);
-  assert.strictEqual(flat.username, 'cf-user');
 
-  const asArray = __testing.normalizeCloudflareResponse({
-    iceServers: [{ urls: 'turn:one', username: 'u', credential: 'c' }],
+  const documented = __testing.normalizeCloudflareResponse(CREDENTIALS);
+  assert.strictEqual(documented.length, 2, 'STUN and TURN entries both kept');
+  assert.strictEqual(documented.find((s) => s.username).username, 'cf-user');
+
+  // An older shape returned the TURN entry on its own, not in an array
+  const bare = __testing.normalizeCloudflareResponse({
+    iceServers: { urls: 'turn:one', username: 'u', credential: 'c' },
   });
-  assert.deepStrictEqual(asArray, { urls: ['turn:one'], username: 'u', credential: 'c' });
+  assert.deepStrictEqual(bare, [{ urls: ['turn:one'], username: 'u', credential: 'c' }]);
 
   const snakeCase = __testing.normalizeCloudflareResponse({
-    ice_servers: { urls: ['turn:two'], username: 'u2', credential: 'c2' },
+    ice_servers: [{ urls: ['turn:two'], username: 'u2', credential: 'c2' }],
   });
-  assert.strictEqual(snakeCase.username, 'u2');
+  assert.strictEqual(snakeCase[0].username, 'u2');
+});
+
+test('a response carrying only STUN is refused — it is not a relay', async () => {
+  const { __testing } = require('../server');
+  assert.strictEqual(
+    __testing.normalizeCloudflareResponse({ iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] }] }),
+    null
+  );
 });
