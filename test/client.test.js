@@ -86,6 +86,98 @@ test('a denied prompt does not poison later attempts', async () => {
   assert.ok(stream.getVideoTracks().length === 1);
 });
 
+test('a capture that lands after hang-up does not leave the camera running', async () => {
+  // The permission prompt can outlive the call. Adopting the stream then
+  // would put a live camera behind the home screen with nothing explaining it.
+  let releaseCapture;
+  const env = createBrowser({
+    getUserMedia: () => new Promise((resolve) => { releaseCapture = () => resolve(fakeStream(['audio', 'video'])); }),
+  });
+
+  const app = new env.CallingApp();
+  const pending = app.acquireLocalMedia();
+  app.endCall();
+  releaseCapture();
+  await pending.catch(() => {});
+  await tick();
+
+  assert.strictEqual(app.localStream, null, 'the abandoned stream must not become current');
+  const captured = await pending;
+  assert.ok(
+    captured.getTracks().every((t) => t.readyState === 'ended'),
+    'and its tracks must be stopped'
+  );
+});
+
+test('a throttled rejoin is retried instead of ending the call', async () => {
+  const env = createBrowser();
+  const { app, socket } = await joinedApp(env, { clientId: 'aaaa' });
+
+  socket.close();
+  await tick();
+  env.window.dispatchEvent(new env.window.Event('online'));
+  await tick();
+  const reconnected = env.lastSocket();
+  reconnected.open();
+
+  reconnected.deliver({ type: 'error', code: 'too-many-joins', text: 'Слишком много попыток.' });
+  await tick();
+
+  assert.strictEqual(app.roomId, 'ROOM01', 'a transient throttle must not end the call');
+  assert.strictEqual(
+    env.document.getElementById('call-screen').classList.contains('active'),
+    true
+  );
+});
+
+test('an impolite peer re-asserts its offer on collision so the pair cannot deadlock', async () => {
+  // The impolite peer is also the designated offerer. If its offer was the one
+  // that went missing, staying silent when the other side offers would strand
+  // both of them.
+  const env = createBrowser();
+  const { app, socket } = await joinedApp(env, { clientId: 'aaaa' });
+
+  await app.createOffer('zzzz');
+  const mine = socket.sent.filter((m) => m.type === 'offer').pop();
+
+  socket.deliver({
+    type: 'offer',
+    senderId: 'zzzz',
+    offer: { type: 'offer', sdp: 'theirs' },
+    sessionId: 'zzzz:1',
+  });
+  await tick();
+
+  const offers = socket.sent.filter((m) => m.type === 'offer');
+  assert.strictEqual(offers.length, 2, 'our offer is sent again');
+  assert.strictEqual(offers[1].sessionId, mine.sessionId);
+  assert.strictEqual(
+    socket.sent.filter((m) => m.type === 'answer').length,
+    0,
+    'and we do not answer — we are the offerer'
+  );
+});
+
+test('a peer that cannot encrypt does not win the rekey election', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'mmmm' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(4), 'aaaa', 1);
+  // 'aaaa' has the lowest id but reports it cannot encrypt
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-unsupported' }));
+  outbox.length = 0;
+
+  app.handlePeerLeft('zzzz');
+  await tick();
+
+  const rekey = outbox.filter((m) => m.kind === 'e2ee-key').pop();
+  assert.ok(rekey, 'we take over the rotation instead');
+  assert.strictEqual(rekey.owner, 'mmmm');
+});
+
 test('exactly one side of a pair offers', async () => {
   const env = createBrowser();
   const app = new env.CallingApp();
