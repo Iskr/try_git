@@ -12,8 +12,11 @@ services:
       # HSTS and the client IP the per-IP limits are keyed on.
       - key: TRUST_PROXY
         value: "1"
-      # Set these in the dashboard when running your own TURN server:
-      # - key: TURN_SERVER_URL
-      #   sync: false
-      # - key: TURN_STATIC_AUTH_SECRET
-      #   sync: false
+      # TURN. `sync: false` means "this service needs the variable, but its
+      # value lives in the dashboard, not in this file" — nothing sensitive
+      # is committed, and Render prompts for it instead of silently starting
+      # without a relay.
+      - key: TURN_SERVER_URL
+        sync: false
+      - key: TURN_STATIC_AUTH_SECRET
+        sync: false
