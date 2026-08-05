@@ -269,6 +269,118 @@ test('a page entering the back/forward cache keeps its seat', async () => {
   assert.strictEqual(socket.sent.filter((m) => m.type === 'leave').length, 1);
 });
 
+// --- E2EE key agreement -----------------------------------------------------
+
+function keyOf(byte) {
+  return Array.from({ length: 32 }, () => byte);
+}
+
+// A control channel the app believes is open, so broadcastControl actually
+// records what would have gone to the peer.
+function attachControlChannel(app, peerId) {
+  const outbox = [];
+  app.controlChannels.set(peerId, {
+    readyState: 'open',
+    send: (raw) => outbox.push(JSON.parse(raw)),
+  });
+  return outbox;
+}
+
+test('the owner can replace its own key — rotation is not mistaken for a rival key', async () => {
+  // Comparing owner ids alone would make a peer reject the owner's new key and
+  // re-assert the old one, leaving the room split across two keys with the
+  // owner's media undecodable.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'bbbb' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(1), 'aaaa', 1);
+  assert.ok(app.frameCryptor.hasSameKey(new Uint8Array(keyOf(1))));
+
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(2), 'aaaa', 2);
+  assert.ok(app.frameCryptor.hasSameKey(new Uint8Array(keyOf(2))), 'the rotated key must be adopted');
+  assert.strictEqual(app.keyEpoch, 2);
+  assert.strictEqual(outbox.length, 0, 'nothing to re-assert — the peer is ahead of us');
+});
+
+test('a stale key is refused and the newer one re-asserted', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'bbbb' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(2), 'aaaa', 2);
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(1), 'aaaa', 1);
+
+  assert.ok(app.frameCryptor.hasSameKey(new Uint8Array(keyOf(2))));
+  assert.strictEqual(outbox.length, 1);
+  assert.strictEqual(outbox[0].kind, 'e2ee-key');
+  assert.strictEqual(outbox[0].epoch, 2);
+});
+
+test('two peers enabling at once converge on the same key', async () => {
+  // Same epoch, different owners: the lower owner id wins, and both sides
+  // compute that identically.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'mmmm' });
+  const outbox = attachControlChannel(app, 'zzzz');
+
+  await app.handleRemoteEncryptionKey('zzzz', keyOf(9), 'zzzz', 1);
+  assert.ok(app.frameCryptor.hasSameKey(new Uint8Array(keyOf(9))));
+
+  // A key from a lower-id owner at the same epoch outranks it
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(3), 'aaaa', 1);
+  assert.ok(app.frameCryptor.hasSameKey(new Uint8Array(keyOf(3))));
+  assert.strictEqual(app.keyOwner, 'aaaa');
+
+  // ...and the loser's key does not come back
+  outbox.length = 0;
+  await app.handleRemoteEncryptionKey('zzzz', keyOf(9), 'zzzz', 1);
+  assert.ok(app.frameCryptor.hasSameKey(new Uint8Array(keyOf(3))));
+  assert.strictEqual(outbox[0].epoch, 1);
+  assert.strictEqual(outbox[0].owner, 'aaaa');
+});
+
+test('a departing participant triggers a rekey by the lowest remaining peer', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('mmmm', { id: 'mmmm', name: 'M' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'mmmm');
+
+  // The key owner is the one who leaves — the rekey must still happen
+  await app.handleRemoteEncryptionKey('zzzz', keyOf(4), 'zzzz', 1);
+  const before = Array.from(app.frameCryptor.rawKeyData);
+
+  app.handlePeerLeft('zzzz');
+  await tick();
+
+  const rekey = outbox.filter((m) => m.kind === 'e2ee-key').pop();
+  assert.ok(rekey, 'the remaining peers must be given a new key');
+  assert.strictEqual(rekey.owner, 'aaaa');
+  assert.strictEqual(rekey.epoch, 2);
+  assert.notDeepStrictEqual(Array.from(app.frameCryptor.rawKeyData), before);
+});
+
+test('only one peer rekeys after a departure', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'mmmm' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(4), 'aaaa', 1);
+  outbox.length = 0;
+
+  app.handlePeerLeft('zzzz');
+  await tick();
+
+  assert.strictEqual(
+    outbox.filter((m) => m.kind === 'e2ee-key').length,
+    0,
+    'aaaa is lower than mmmm, so aaaa rekeys and we stay quiet'
+  );
+});
+
 test('reconnecting does not leave two live sockets racing', async () => {
   const env = createBrowser();
   const { app } = await joinedApp(env, { clientId: 'aaaa' });

@@ -250,8 +250,10 @@ class CallingApp {
         // the pair forever. Map<clientId, timeoutId>
         this._negotiationTimers = new Map();
         this._sessionCounter = 0;
-        // clientId of the participant whose E2EE key the room converged on
+        // The room converges on the key with the highest (epoch, lowest owner
+        // id). keyOwner is who announced it; keyEpoch counts rotations.
         this.keyOwner = null;
+        this.keyEpoch = 0;
 
         this.rtcConfig = DEFAULT_RTC_CONFIG;
         this.maxParticipants = MAX_PARTICIPANTS;
@@ -1235,7 +1237,8 @@ class CallingApp {
                 this.sendControl(remoteClientId, {
                     kind: 'e2ee-key',
                     key: Array.from(this.frameCryptor.rawKeyData),
-                    owner: this.keyOwner
+                    owner: this.keyOwner,
+                    epoch: this.keyEpoch
                 });
             }
         };
@@ -1279,7 +1282,7 @@ class CallingApp {
 
         switch (message.kind) {
             case 'e2ee-key':
-                await this.handleRemoteEncryptionKey(senderId, message.key, message.owner);
+                await this.handleRemoteEncryptionKey(senderId, message.key, message.owner, message.epoch);
                 break;
             case 'e2ee-off':
                 this.handleRemoteEncryptionDisabled(senderId);
@@ -1296,7 +1299,20 @@ class CallingApp {
         }
     }
 
-    async handleRemoteEncryptionKey(senderId, key, owner) {
+    // Keys are ordered by (epoch, owner): a higher epoch always wins, and an
+    // equal epoch is broken by the lexicographically smaller owner id. That
+    // ordering is a total order every peer computes identically, so the room
+    // converges no matter what order the announcements arrive in — and, unlike
+    // comparing owners alone, it lets the current owner replace its own key
+    // (rotation) and lets ownership move to somebody else.
+    _keyBeats(remoteEpoch, remoteOwner) {
+        if (this.keyEpoch !== remoteEpoch) {
+            return this.keyEpoch > remoteEpoch;
+        }
+        return Boolean(this.keyOwner) && this.keyOwner < remoteOwner;
+    }
+
+    async handleRemoteEncryptionKey(senderId, key, owner, epoch) {
         if (!Array.isArray(key) || key.length !== E2EE_KEY_BYTES ||
             !key.every(b => Number.isInteger(b) && b >= 0 && b <= 255)) {
             console.warn('Ignoring invalid encryption key from', senderId);
@@ -1310,21 +1326,20 @@ class CallingApp {
             return;
         }
         const keyOwner = typeof owner === 'string' && owner ? owner : senderId;
+        const keyEpoch = Number.isInteger(epoch) && epoch > 0 ? epoch : 1;
 
         try {
             const keyData = new Uint8Array(key);
 
-            // Two peers can enable encryption simultaneously with different
-            // keys. Converge deterministically on the key whose originator
-            // id is lexicographically smallest; the loser re-asserts nothing,
-            // the winner re-sends its key to the sender.
+            // Ours is newer: re-assert it instead of adopting a stale key.
             if (this.frameCryptor.encryptionEnabled && this.frameCryptor.rawKeyData &&
                 !this.frameCryptor.hasSameKey(keyData) &&
-                this.keyOwner && this.keyOwner <= keyOwner) {
+                this._keyBeats(keyEpoch, keyOwner)) {
                 this.sendControl(senderId, {
                     kind: 'e2ee-key',
                     key: Array.from(this.frameCryptor.rawKeyData),
-                    owner: this.keyOwner
+                    owner: this.keyOwner,
+                    epoch: this.keyEpoch
                 });
                 return;
             }
@@ -1334,6 +1349,7 @@ class CallingApp {
                 await this.frameCryptor.setKey(keyData);
             }
             this.keyOwner = keyOwner;
+            this.keyEpoch = keyEpoch;
             this.frameCryptor.enable();
             this.updateEncryptionUI(true);
             if (!alreadyActive) {
@@ -1623,19 +1639,25 @@ class CallingApp {
         this.rotateEncryptionKey();
     }
 
-    // Whoever owns the room key rotates it when somebody leaves, so a departed
-    // participant cannot decrypt anything sent after they were gone.
+    // The key is rotated when somebody leaves, so a departed participant
+    // cannot decrypt anything sent after they were gone. The remaining peer
+    // with the lowest id does it — picking the current key owner would do
+    // nothing in the case that matters most, which is the owner leaving.
     async rotateEncryptionKey() {
         if (!this.frameCryptor.encryptionEnabled) return;
-        if (this.keyOwner !== this.clientId) return;
         if (this.controlChannels.size === 0) return;
+        const remaining = Array.from(this.participants.keys()).sort();
+        if (remaining[0] !== this.clientId) return;
 
         try {
             await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
+            this.keyOwner = this.clientId;
+            this.keyEpoch += 1;
             this.broadcastControl({
                 kind: 'e2ee-key',
                 key: Array.from(this.frameCryptor.rawKeyData),
-                owner: this.keyOwner
+                owner: this.keyOwner,
+                epoch: this.keyEpoch
             });
             console.log('Encryption key rotated after a participant left');
         } catch (error) {
@@ -1720,13 +1742,15 @@ class CallingApp {
             // off and on after someone leaves locks the old key out.
             await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
             this.keyOwner = this.clientId;
+            this.keyEpoch += 1;
             this.frameCryptor.enable();
             // The key travels only over DTLS-encrypted peer-to-peer data
             // channels — the signaling server never sees it.
             this.broadcastControl({
                 kind: 'e2ee-key',
                 key: Array.from(this.frameCryptor.rawKeyData),
-                owner: this.keyOwner
+                owner: this.keyOwner,
+                epoch: this.keyEpoch
             });
             this.showToast('🔒 Шифрование включено');
         } else {
@@ -2073,6 +2097,7 @@ class CallingApp {
         this.clientId = null;
         this.resumeToken = null;
         this.keyOwner = null;
+        this.keyEpoch = 0;
         this.pendingJoinRoomId = null;
         this._lastRequestedRoom = null;
         this._joining = false;
