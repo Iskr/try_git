@@ -168,33 +168,40 @@ const CLOUDFLARE_TURN_TTL_SECONDS = intFromEnv('CLOUDFLARE_TURN_TTL_SECONDS', 6 
 // into one request per visitor.
 const CLOUDFLARE_TURN_ERROR_BACKOFF_MS = 60000;
 
-const cloudflareTurn = { entry: null, expiresAt: 0, failedUntil: 0, inflight: null };
+const cloudflareTurn = { entries: null, expiresAt: 0, failedUntil: 0, inflight: null };
 
-// Their API has returned the credentials under slightly different shapes over
-// time; accept any of them rather than silently serving a call with no relay.
+// The documented response is an array holding Cloudflare's STUN entry and a
+// TURN entry with credentials; older shapes returned the TURN entry on its
+// own. Accept either, and keep every entry — their STUN on port 53 gets
+// through networks that block 3478.
 function normalizeCloudflareResponse(body) {
   const raw = body && (body.iceServers || body.ice_servers);
   if (!raw) return null;
-  const list = Array.isArray(raw) ? raw : [raw];
-  const entry = list.find((s) => s && s.urls && s.username && s.credential);
-  if (!entry) return null;
-  return {
-    urls: Array.isArray(entry.urls) ? entry.urls : [entry.urls],
-    username: entry.username,
-    credential: entry.credential,
-  };
+  const list = (Array.isArray(raw) ? raw : [raw])
+    .filter((s) => s && s.urls)
+    .map((s) => {
+      const entry = { urls: Array.isArray(s.urls) ? s.urls : [s.urls] };
+      if (s.username && s.credential) {
+        entry.username = s.username;
+        entry.credential = s.credential;
+      }
+      return entry;
+    });
+  // Without a credentialed entry there is no relay, only STUN we already have
+  if (!list.some((s) => s.username && s.credential)) return null;
+  return list;
 }
 
-async function cloudflareIceServer() {
+async function cloudflareIceServers() {
   if (!CLOUDFLARE_TURN_KEY_ID || !CLOUDFLARE_TURN_API_TOKEN) {
     return null;
   }
   const now = Date.now();
-  if (cloudflareTurn.entry && now < cloudflareTurn.expiresAt) {
-    return cloudflareTurn.entry;
+  if (cloudflareTurn.entries && now < cloudflareTurn.expiresAt) {
+    return cloudflareTurn.entries;
   }
   if (now < cloudflareTurn.failedUntil) {
-    return cloudflareTurn.entry;
+    return cloudflareTurn.entries;
   }
   // Coalesce: a burst of joins must produce one API call, not one each.
   if (cloudflareTurn.inflight) {
@@ -204,7 +211,7 @@ async function cloudflareIceServer() {
   cloudflareTurn.inflight = (async () => {
     try {
       const res = await fetch(
-        `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(CLOUDFLARE_TURN_KEY_ID)}/credentials/generate`,
+        `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(CLOUDFLARE_TURN_KEY_ID)}/credentials/generate-ice-servers`,
         {
           method: 'POST',
           headers: {
@@ -218,21 +225,21 @@ async function cloudflareIceServer() {
       if (!res.ok) {
         throw new Error(`Cloudflare TURN API returned ${res.status}`);
       }
-      const entry = normalizeCloudflareResponse(await res.json());
-      if (!entry) {
+      const entries = normalizeCloudflareResponse(await res.json());
+      if (!entries) {
         throw new Error('Cloudflare TURN API returned an unrecognised body');
       }
-      cloudflareTurn.entry = entry;
+      cloudflareTurn.entries = entries;
       // Refresh early so a call never starts on credentials about to expire
       cloudflareTurn.expiresAt = Date.now() + Math.max(60, CLOUDFLARE_TURN_TTL_SECONDS * 0.8) * 1000;
       cloudflareTurn.failedUntil = 0;
-      return entry;
+      return entries;
     } catch (error) {
       logWarn('Could not fetch Cloudflare TURN credentials:', error.message);
       cloudflareTurn.failedUntil = Date.now() + CLOUDFLARE_TURN_ERROR_BACKOFF_MS;
       // Keep serving the previous credentials if we have any — stale relays
       // beat no relay.
-      return cloudflareTurn.entry;
+      return cloudflareTurn.entries;
     } finally {
       cloudflareTurn.inflight = null;
     }
@@ -264,9 +271,9 @@ app.get('/config', async (req, res) => {
   // Both can be configured at once: more candidate paths, more calls that
   // connect. A failure here must never take /config down with it.
   try {
-    const cloudflare = await cloudflareIceServer();
+    const cloudflare = await cloudflareIceServers();
     if (cloudflare) {
-      iceServers.push(cloudflare);
+      iceServers.push(...cloudflare);
     }
   } catch (error) {
     logWarn('Cloudflare TURN lookup failed:', error.message);
@@ -747,7 +754,7 @@ module.exports = {
   __testing: {
     normalizeCloudflareResponse,
     resetCloudflareCache(keepEntry) {
-      if (!keepEntry) cloudflareTurn.entry = null;
+      if (!keepEntry) cloudflareTurn.entries = null;
       cloudflareTurn.expiresAt = 0;
       cloudflareTurn.failedUntil = 0;
       cloudflareTurn.inflight = null;
