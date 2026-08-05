@@ -384,6 +384,74 @@ test('switching identity via rejoin while in a room does not orphan the old entr
   assert.strictEqual(rooms.has('SWAP01'), false, 'room must be collected once empty');
 });
 
+test('a rejoin that cannot be granted leaves the caller in the room it was in', async () => {
+  // Vacating the seat before validating the target room would eject a client
+  // from a working call on a typo — peers get peer-left, and everything the
+  // client signals afterwards is silently discarded by the server.
+  const donor = await connect();
+  const donated = await join(donor, 'DONOR3');
+  donor.ws.close();
+  await settle(100);
+
+  const a = await connect();
+  const b = await connect();
+  const joinedA = await join(a, 'EVICT1');
+  const joinedB = await join(b, 'EVICT1');
+  await nextMessage(a, 'peer-joined');
+
+  send(a, {
+    type: 'rejoin',
+    roomId: 'not-a-room',
+    clientId: donated.clientId,
+    resumeToken: donated.resumeToken,
+  });
+  const err = await nextMessage(a, 'error');
+  assert.strictEqual(err.code, 'invalid-room');
+
+  await settle();
+  assert.ok(rooms.get('EVICT1').has(joinedA.clientId), 'the caller keeps its seat');
+  assert.strictEqual(b.messages.filter((m) => m.type === 'peer-left').length, 0);
+
+  // ...and its signaling still reaches the room
+  send(a, { type: 'offer', offer: { sdp: 'x' }, targetId: joinedB.clientId });
+  const offer = await nextMessage(b, 'offer');
+  assert.strictEqual(offer.senderId, joinedA.clientId);
+
+  a.ws.close();
+  b.ws.close();
+});
+
+test('a rejoin into a full room does not cost the caller its current seat', async () => {
+  const donor = await connect();
+  const donated = await join(donor, 'DONOR4');
+  donor.ws.close();
+  await settle(100);
+
+  const occupants = [];
+  for (let i = 0; i < maxParticipants; i++) {
+    const client = await connect();
+    await join(client, 'FULL02');
+    occupants.push(client);
+  }
+
+  const a = await connect();
+  const joinedA = await join(a, 'KEEP01');
+  send(a, {
+    type: 'rejoin',
+    roomId: 'FULL02',
+    clientId: donated.clientId,
+    resumeToken: donated.resumeToken,
+  });
+  const full = await nextMessage(a, 'room-full');
+  assert.strictEqual(full.roomId, 'FULL02');
+
+  await settle();
+  assert.ok(rooms.get('KEEP01').has(joinedA.clientId), 'the caller keeps its seat');
+
+  occupants.forEach((c) => c.ws.close());
+  a.ws.close();
+});
+
 test('peers are told when a member abandons its identity mid-call', async () => {
   const donor = await connect();
   const donated = await join(donor, 'DONOR2');

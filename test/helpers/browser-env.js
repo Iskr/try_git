@@ -8,6 +8,20 @@ const { JSDOM } = require('jsdom');
 
 const PUBLIC_DIR = path.join(__dirname, '..', '..', 'public');
 
+// Every app instance arms a heartbeat interval and reconnect timers on the
+// jsdom window. Left running they keep the test process alive long after the
+// assertions finish, so each window is closed when the suite ends.
+const openWindows = [];
+
+function closeAll() {
+  while (openWindows.length > 0) {
+    const window = openWindows.pop();
+    try {
+      window.close();
+    } catch (error) { /* already torn down */ }
+  }
+}
+
 function fakeTrack(kind) {
   return {
     kind,
@@ -37,6 +51,7 @@ function createBrowser(options = {}) {
     pretendToBeVisual: true,
   });
   const { window } = dom;
+  openWindows.push(window);
 
   const sent = [];
   const sockets = [];
@@ -64,6 +79,17 @@ function createBrowser(options = {}) {
     open() {
       this.readyState = FakeWebSocket.OPEN;
       if (this.onopen) this.onopen({});
+    }
+
+    // A real socket sits in CLOSING between close() and the peer's close
+    // frame. Splitting the two lets tests cover what the app does in between.
+    beginClose() {
+      this.readyState = FakeWebSocket.CLOSING;
+    }
+
+    finishClose() {
+      this.readyState = FakeWebSocket.CLOSED;
+      if (this.onclose) this.onclose({});
     }
 
     deliver(message) {
@@ -261,4 +287,4 @@ async function joinedApp(env, { clientId = 'client-b', participants = [] } = {})
   return { app, socket };
 }
 
-module.exports = { createBrowser, joinedApp, fakeStream };
+module.exports = { createBrowser, joinedApp, fakeStream, closeAll };

@@ -34,8 +34,10 @@ const RATE_LIMIT_PER_SECOND = 50;
 const RATE_LIMIT_CLOSE_AFTER = 2 * RATE_LIMIT_PER_SECOND;
 // Number of proxy hops in front of us. Only trusted hops may set the client
 // IP — trusting X-Forwarded-For blindly would let an attacker forge a fresh
-// "IP" per connection and walk straight through the per-IP limits.
-const TRUST_PROXY = intFromEnv('TRUST_PROXY', process.env.NODE_ENV === 'production' ? 1 : 0);
+// "IP" per connection and walk straight through the per-IP limits. Defaults to
+// 0 everywhere: guessing "1" for production would silently hand that bypass to
+// any deployment that is in fact directly exposed.
+const TRUST_PROXY = intFromEnv('TRUST_PROXY', 0);
 // Empty list means "same origin only".
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -116,8 +118,10 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
-  // req.secure already accounts for x-forwarded-proto through trusted hops
-  if (req.secure) {
+  // req.secure covers x-forwarded-proto through trusted hops; the raw header
+  // is honoured too, because failing to send HSTS on a TLS deployment that
+  // has not set TRUST_PROXY is worse than a client pinning HSTS on itself.
+  if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
   next();
@@ -235,7 +239,10 @@ function originAllowed(req) {
 // lazily from the timestamp of the previous message.
 function takeToken(bucket, ratePerSecond, burst) {
   const now = Date.now();
-  bucket.tokens = Math.min(burst, bucket.tokens + ((now - bucket.updatedAt) / 1000) * ratePerSecond);
+  // Clamp at zero: a backwards clock step must not drain a healthy client's
+  // budget and close its connection.
+  const elapsed = Math.max(0, now - bucket.updatedAt) / 1000;
+  bucket.tokens = Math.min(burst, bucket.tokens + elapsed * ratePerSecond);
   bucket.updatedAt = now;
   if (bucket.tokens < 1) {
     return false;
@@ -297,7 +304,11 @@ function broadcast(roomId, message, excludeId) {
   });
 }
 
-function handleJoin(ws, state, rawRoomId) {
+// `identity` is the clientId a verified rejoin asked to reuse, or null. Every
+// check below runs before the client's current seat is given up, so a join
+// that cannot be granted leaves the caller exactly where it was rather than
+// ejecting it from a working call.
+function handleJoin(ws, state, rawRoomId, identity) {
   if (typeof rawRoomId !== 'string') {
     sendError(ws, 'invalid-room', 'Некорректный код звонка');
     return;
@@ -314,47 +325,52 @@ function handleJoin(ws, state, rawRoomId) {
     return;
   }
 
+  const clientId = identity || state.clientId;
+  const existing = rooms.get(roomId);
+
   // Re-joining the room this socket already occupies is a no-op: peers treat
   // 'peer-joined' for a known id as "reconnected" and tear their session
   // down, so re-broadcasting it would let a member spam renegotiations.
-  const currentRoom = rooms.get(roomId);
-  if (state.roomId === roomId && currentRoom && currentRoom.get(state.clientId) === ws) {
+  if (state.roomId === roomId && existing && existing.get(clientId) === ws) {
     sendTo(ws, {
       type: 'joined',
       roomId,
-      clientId: state.clientId,
-      participants: Array.from(currentRoom.keys()).filter((id) => id !== state.clientId),
-      resumeToken: resumeTokenFor(state.clientId),
+      clientId,
+      participants: Array.from(existing.keys()).filter((id) => id !== clientId),
+      resumeToken: resumeTokenFor(clientId),
     });
     return;
   }
 
-  // Leaving the previous room first prevents stale entries when a client
-  // joins a new room over the same connection.
-  if (state.roomId && state.roomId !== roomId) {
-    handleLeave(state);
-  }
-
-  let room = rooms.get(roomId);
-  if (!room) {
-    if (rooms.size >= MAX_ROOMS) {
-      sendError(ws, 'server-busy', 'Сервер перегружен, попробуйте позже');
-      return;
-    }
-    room = new Map();
-    rooms.set(roomId, room);
+  if (!existing && rooms.size >= MAX_ROOMS) {
+    sendError(ws, 'server-busy', 'Сервер перегружен, попробуйте позже');
+    return;
   }
 
   // A rejoining client replaces its own (possibly dead) entry, so it is
   // exempt from the participant limit.
-  if (!room.has(state.clientId) && room.size >= MAX_PARTICIPANTS) {
+  if (existing && !existing.has(clientId) && existing.size >= MAX_PARTICIPANTS) {
     sendTo(ws, { type: 'room-full', roomId, maxParticipants: MAX_PARTICIPANTS });
     return;
   }
 
+  // Admitted. Only now is it safe to release whatever this socket held:
+  // leaving the old room, and — for a rejoin — the seat under the old
+  // identity, which would otherwise be orphaned in the room map forever.
+  if (state.roomId && (state.roomId !== roomId || clientId !== state.clientId)) {
+    handleLeave(state);
+  }
+  state.clientId = clientId;
+
+  let room = rooms.get(roomId);
+  if (!room) {
+    room = new Map();
+    rooms.set(roomId, room);
+  }
+
   room.set(state.clientId, ws);
   state.roomId = roomId;
-  state.everJoined = true;
+  state.idleSince = null;
 
   const participants = Array.from(room.keys()).filter((id) => id !== state.clientId);
 
@@ -386,7 +402,9 @@ function handleSignaling(state, data) {
     return;
   }
   if (targetClient.bufferedAmount > MAX_BUFFERED_BYTES) {
-    targetClient.close(1013, 'Send buffer overflow');
+    // Drop rather than close: the sender is another room member, and closing
+    // here would hand any member a way to disconnect a peer on a slow link.
+    // Genuinely stuck sockets are still closed by sendTo/broadcast.
     return;
   }
   // senderId is always set server-side so clients cannot spoof it
@@ -400,6 +418,7 @@ function handleLeave(state) {
   }
 
   state.roomId = null;
+  state.idleSince = Date.now();
   const room = rooms.get(roomId);
   // Only remove the entry if it still belongs to this connection — after a
   // reconnect the clientId may already be owned by a newer socket.
@@ -418,7 +437,8 @@ function handleLeave(state) {
   logDebug(`Client ${clientId} left room ${roomId}`);
 }
 
-server.on('upgrade', (req, socket, head) => {
+function handleUpgrade(req, socket, head) {
+  socket.on('error', () => { /* a half-open socket must not throw */ });
   if (!originAllowed(req)) {
     logWarn(`Rejected WebSocket upgrade from origin: ${req.headers.origin}`);
     socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
@@ -428,11 +448,25 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
     wss.emit('connection', ws, req);
   });
-});
+}
+
+server.on('upgrade', handleUpgrade);
 
 wss.on('connection', (ws, req) => {
+  // Install this before anything that can return early. An 'error' emitted on
+  // a socket with no listener is an uncaught exception, and a rejected client
+  // can still feed the frame parser — one host could otherwise take the whole
+  // server down by sending a malformed frame after being turned away.
+  ws.on('error', (error) => {
+    const id = ws.state ? ws.state.clientId : 'unidentified';
+    logWarn(`WebSocket error (${id}):`, error.message);
+  });
+
+  // Rejections terminate rather than close: a graceful close leaves the socket
+  // alive for up to 30s, which is long enough to park sockets against the
+  // global cap without ever counting against the per-IP one.
   if (wss.clients.size > MAX_CONNECTIONS) {
-    ws.close(1013, 'Server overloaded');
+    ws.terminate();
     return;
   }
 
@@ -440,7 +474,7 @@ wss.on('connection', (ws, req) => {
   const perIp = (connectionsByIp.get(ip) || 0) + 1;
   if (perIp > MAX_CONNECTIONS_PER_IP) {
     logWarn(`Connection limit reached for ${ip}`);
-    ws.close(1013, 'Too many connections');
+    ws.terminate();
     return;
   }
   connectionsByIp.set(ip, perIp);
@@ -450,7 +484,8 @@ wss.on('connection', (ws, req) => {
     ip,
     clientId: crypto.randomUUID(),
     roomId: null,
-    everJoined: false,
+    // Timestamp since which this socket has held no room; null while in one.
+    idleSince: Date.now(),
     connectedAt: Date.now(),
   };
   ws.state = state;
@@ -493,15 +528,12 @@ wss.on('connection', (ws, req) => {
         handleJoin(ws, state, data.roomId);
       } else if (data.type === 'rejoin') {
         // Reuse the old clientId only when the resume token proves ownership;
-        // otherwise fall back to a fresh identity.
-        if (verifyResumeToken(data.clientId, data.resumeToken) && data.clientId !== state.clientId) {
-          // Vacate the seat held under the current identity first, or the old
-          // entry is orphaned in the room map forever (the room then never
-          // empties and its slot is burned).
-          handleLeave(state);
-          state.clientId = data.clientId;
-        }
-        handleJoin(ws, state, data.roomId);
+        // otherwise fall back to a fresh identity. handleJoin performs the
+        // switch itself, once it knows the join will be accepted.
+        const identity = verifyResumeToken(data.clientId, data.resumeToken)
+          ? data.clientId
+          : null;
+        handleJoin(ws, state, data.roomId, identity);
       } else if (SIGNALING_TYPES.has(data.type)) {
         handleSignaling(state, data);
       } else if (data.type === 'leave') {
@@ -522,10 +554,6 @@ wss.on('connection', (ws, req) => {
     }
     logDebug(`Client disconnected: ${state.clientId}`);
     handleLeave(state);
-  });
-
-  ws.on('error', (error) => {
-    logWarn(`WebSocket error (${state.clientId}):`, error.message);
   });
 });
 
@@ -556,7 +584,7 @@ const heartbeat = setInterval(() => {
       return;
     }
     const state = ws.state;
-    if (state && !state.everJoined && now - state.connectedAt > IDLE_TIMEOUT_MS) {
+    if (state && state.idleSince && now - state.idleSince > IDLE_TIMEOUT_MS) {
       ws.close(1000, 'Idle');
       return;
     }
@@ -582,9 +610,17 @@ wss.on('close', () => {
 
 function stop() {
   clearInterval(heartbeat);
+  server.removeListener('upgrade', handleUpgrade);
   wss.clients.forEach((ws) => ws.close(1001, 'Server shutting down'));
+  // A client that never answers the close frame would otherwise hold the
+  // shutdown for ws's full 30s close timeout.
+  const forceClose = setTimeout(() => {
+    wss.clients.forEach((ws) => ws.terminate());
+  }, 1000);
+  forceClose.unref();
   return new Promise((resolve) => {
     wss.close(() => {
+      clearTimeout(forceClose);
       server.close(() => resolve());
     });
   });
