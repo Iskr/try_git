@@ -1,10 +1,19 @@
 services:
   - type: web
     name: calling-service
-    env: node
-    buildCommand: npm install
+    runtime: node
+    buildCommand: npm ci --omit=dev
     startCommand: npm start
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+      # Render terminates TLS one hop in front of the app. This drives both
+      # HSTS and the client IP the per-IP limits are keyed on.
+      - key: TRUST_PROXY
+        value: "1"
+      # Set these in the dashboard when running your own TURN server:
+      # - key: TURN_SERVER_URL
+      #   sync: false
+      # - key: TURN_STATIC_AUTH_SECRET
+      #   sync: false
