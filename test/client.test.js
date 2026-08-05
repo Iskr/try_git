@@ -401,6 +401,45 @@ test('an unrelated mid-call error does not end the call', async () => {
   assert.strictEqual(app.roomId, 'ROOM01', 'only a failed rejoin is fatal');
 });
 
+test('remote tiles start muted so iOS will autoplay them at all', async () => {
+  // iOS refuses to autoplay an unmuted element. Unmuting before play() —
+  // which is what routing WebKit audio through the element naively does —
+  // costs the video entirely: the tile just stays black.
+  const env = createBrowser({ webkit: true });
+  const played = [];
+  env.window.HTMLMediaElement.prototype.play = function play() {
+    played.push({ id: this.id, mutedAtPlay: this.muted });
+    return Promise.resolve();
+  };
+
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Участник zzzz' });
+  app.addVideoStream('zzzz', fakeStream(['audio', 'video']), false);
+  await tick();
+
+  const remotePlay = played.find((p) => p.id === 'video-zzzz');
+  assert.ok(remotePlay, 'the remote tile must be started');
+  assert.strictEqual(remotePlay.mutedAtPlay, true, 'muted when play() is called');
+
+  // ...and its audio is switched on once playback is running
+  assert.strictEqual(env.document.getElementById('video-zzzz').muted, false);
+});
+
+test('remote tiles keep Web Audio routing on browsers where it works', async () => {
+  const env = createBrowser();
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Участник zzzz' });
+  app.addVideoStream('zzzz', fakeStream(['audio', 'video']), false);
+  await tick();
+
+  assert.strictEqual(
+    env.document.getElementById('video-zzzz').muted,
+    true,
+    'the element stays muted — audio comes out of the gain node'
+  );
+  assert.ok(app.audioContexts.has('zzzz'));
+});
+
 test('remote tiles are placed ahead of the local one so spotlight features a peer', async () => {
   const env = createBrowser();
   const { app } = await joinedApp(env, { clientId: 'aaaa' });

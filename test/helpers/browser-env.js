@@ -45,13 +45,25 @@ function fakeStream(kinds) {
 
 function createBrowser(options = {}) {
   const html = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+  // app.js decides at load time whether this browser can play remote audio
+  // through Web Audio, so the user agent has to be in place before it runs.
+  const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
+    'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+  const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+    'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
   const dom = new JSDOM(html, {
     url: 'http://localhost:3000/',
     runScripts: 'outside-only',
     pretendToBeVisual: true,
+    userAgent: options.webkit ? IPHONE_UA : CHROME_UA,
   });
   const { window } = dom;
   openWindows.push(window);
+  Object.defineProperty(window.navigator, 'userAgent', {
+    value: options.webkit ? IPHONE_UA : CHROME_UA,
+    configurable: true,
+  });
 
   const sent = [];
   const sockets = [];

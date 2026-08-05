@@ -280,6 +280,11 @@ class CallingApp {
         this._iceRestartAttempts = new Map(); // Map<clientId, attemptCount>
         this._iceRestartTimers = new Map();
         this._maxIceRestarts = 4;
+        // Full rebuild cycles per peer. Without a ceiling here the recovery
+        // loop never ends: a full reconnect resets the ICE-restart counter, so
+        // an unreachable peer would be retried forever.
+        this._peerReconnectAttempts = new Map();
+        this._maxPeerReconnects = 3;
 
         // Reactions system
         this.reactions = ['❤️', '👍', '😂', '😮', '😢', '🔥', '🎉', '👏', '💯', '🚀'];
@@ -988,10 +993,11 @@ class CallingApp {
         video.autoplay = true;
         video.playsInline = true;
         video.setAttribute('playsinline', '');
-        // The local tile must always be muted (it would echo). Remote tiles
-        // are muted only where audio is routed through Web Audio instead;
-        // on WebKit that path is silent, so the element itself plays.
-        video.muted = isLocal || this.useWebAudioOutput;
+        // Always start muted. iOS refuses to autoplay an unmuted element, and
+        // a remote tile that never starts shows nothing at all — so sound is
+        // switched on after playback is running (see _enableTileAudio), not
+        // before it.
+        video.muted = true;
 
         const label = document.createElement('div');
         label.className = 'video-label';
@@ -1087,7 +1093,61 @@ class CallingApp {
 
         // Autoplay can be refused (iOS Low Power Mode blocks even muted
         // video); the wrapper's click handler retries inside a user gesture.
-        video.play().catch(e => console.log('Autoplay prevented, tap the tile to start:', e));
+        video.play()
+            .then(() => {
+                if (!isLocal && this._tileCarriesAudio(video)) {
+                    this._enableTileAudio(video);
+                }
+            })
+            .catch((e) => {
+                console.log('Autoplay prevented, tap the tile to start:', e);
+                this._armGestureRecovery();
+            });
+    }
+
+    // True when this tile's own element is the audio sink: on WebKit always,
+    // and anywhere the Web Audio graph could not be built.
+    _tileCarriesAudio(video) {
+        return !this.useWebAudioOutput || video.dataset.elementAudio === '1';
+    }
+
+    // Unmuting is what the browser may refuse, so it is done separately from
+    // starting playback: if it costs us the video we put the mute back and
+    // wait for a tap.
+    _enableTileAudio(video) {
+        video.muted = false;
+        const resumed = video.play();
+        if (resumed && typeof resumed.catch === 'function') {
+            resumed.catch(() => {
+                video.muted = true;
+                video.play().catch(() => { /* handled by the gesture recovery */ });
+                this._armGestureRecovery();
+            });
+        }
+    }
+
+    // One shot: the next tap anywhere starts whatever the autoplay policy
+    // refused — paused tiles, muted remote audio, a suspended AudioContext.
+    _armGestureRecovery() {
+        if (this._gestureRecoveryArmed) return;
+        this._gestureRecoveryArmed = true;
+        this.showToast('Коснитесь экрана, чтобы включить звук и видео');
+
+        const recover = () => {
+            this._gestureRecoveryArmed = false;
+            document.removeEventListener('pointerdown', recover);
+            document.removeEventListener('touchend', recover);
+            this.ensureAudioContext();
+            this.participants.forEach((_, id) => {
+                if (id === this.clientId) return;
+                const video = document.getElementById(`video-${id}`);
+                if (!video) return;
+                if (this._tileCarriesAudio(video)) video.muted = false;
+                video.play().catch(() => { /* nothing more we can do */ });
+            });
+        };
+        document.addEventListener('pointerdown', recover, { once: true });
+        document.addEventListener('touchend', recover, { once: true });
     }
 
     _disconnectAudio(audioSetup) {
@@ -1681,8 +1741,15 @@ class CallingApp {
     }
 
     async _reconnectPeer(clientId) {
-        console.log(`Full reconnect for peer ${clientId}`);
-        this.showToast('Переподключение к участнику...');
+        const cycle = (this._peerReconnectAttempts.get(clientId) || 0) + 1;
+        this._peerReconnectAttempts.set(clientId, cycle);
+        if (cycle > this._maxPeerReconnects) {
+            this._giveUpOnPeer(clientId);
+            return;
+        }
+
+        console.log(`Full reconnect for peer ${clientId} (${cycle}/${this._maxPeerReconnects})`);
+        this.showToast(`Переподключение к участнику (${cycle}/${this._maxPeerReconnects})...`);
 
         // Clean up old connection
         this._clearIceRestartTimer(clientId);
@@ -2039,7 +2106,8 @@ class CallingApp {
         if (!this.useWebAudioOutput) {
             // WebKit: the element is the audio sink. Web Audio would be silent
             // here and would not throw, so there is nothing to fall back from.
-            videoElement.muted = false;
+            // Unmuting happens once playback is running — doing it here would
+            // make the browser refuse to autoplay the tile at all.
             this.ensureAudioContext();
             return;
         }
@@ -2075,8 +2143,9 @@ class CallingApp {
             });
         } catch (error) {
             console.error('Error setting up volume control:', error);
-            // Fallback: unmute video element
-            videoElement.muted = false;
+            // Fall back to the element as the audio sink — but flag it rather
+            // than unmuting now, so autoplay is not refused before it starts.
+            videoElement.dataset.elementAudio = '1';
         }
     }
 
