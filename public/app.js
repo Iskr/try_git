@@ -934,6 +934,12 @@ class CallingApp {
             return false;
         }
 
+        // Hanging up while the permission prompt was open discards the capture,
+        // so there may be no stream and no call left to show it in.
+        if (!this.localStream || !this.roomId) {
+            return false;
+        }
+
         // Honor current mute toggles (relevant after a rejoin)
         this.localStream.getAudioTracks().forEach(t => { t.enabled = this.isAudioEnabled; });
         this.localStream.getVideoTracks().forEach(t => { t.enabled = this.isVideoEnabled; });
@@ -1459,6 +1465,9 @@ class CallingApp {
                 console.error('Cannot offer without local media:', error);
                 return;
             }
+            // The call can end while the prompt is open, in which case the
+            // capture is discarded and there is nobody left to offer to.
+            if (!this.localStream || !this.roomId) return;
         }
 
         // ICE restarts renegotiate the existing connection; everything else
@@ -1491,12 +1500,13 @@ class CallingApp {
         if (!this.localStream) {
             try {
                 await this.acquireLocalMedia();
-                this.addVideoStream(this.clientId, this.localStream, true);
             } catch (error) {
                 console.error('Error accessing media devices:', error);
                 this.showToast(this.mediaErrorMessage(error));
                 return;
             }
+            if (!this.localStream || !this.roomId) return;
+            this.addVideoStream(this.clientId, this.localStream, true);
         }
 
         // An offer can arrive before the peer-joined notification
