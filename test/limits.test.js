@@ -26,6 +26,16 @@ function withTimeout(promise, what, ms = 3000) {
   ]);
 }
 
+// Connection counts are decremented on the socket's 'close' event, which lands
+// a tick or two after the client asks to close.
+async function waitForDrain(deadlineMs = 2000) {
+  const { wss } = require('../server');
+  const started = Date.now();
+  while (wss.clients.size > 0 && Date.now() - started < deadlineMs) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
 before(async () => {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   wsUrl = `ws://127.0.0.1:${server.address().port}`;
@@ -103,6 +113,10 @@ test('creating more rooms than MAX_ROOMS reports server-busy', async () => {
 });
 
 test('a single IP cannot hold more than MAX_CONNECTIONS_PER_IP sockets', async () => {
+  // Sockets from earlier tests close asynchronously; starting while they are
+  // still counted would hit the cap early and hang on the wrong socket.
+  await waitForDrain();
+
   const clients = [];
   for (let i = 0; i < config.MAX_CONNECTIONS_PER_IP; i++) {
     clients.push(await connect());
