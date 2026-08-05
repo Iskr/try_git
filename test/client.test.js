@@ -107,6 +107,38 @@ test('the designated offerer offers on peer-joined and the other side waits', as
   assert.strictEqual(second.socket.sent.filter((m) => m.type === 'offer').length, 0);
 });
 
+test('a peer announced during the permission prompt still gets an offer with media', async () => {
+  // peer-joined can land while our own capture is still pending; offering
+  // then must wait for the stream rather than build a track-less connection.
+  let releaseCapture;
+  const env = createBrowser({
+    getUserMedia: () => new Promise((resolve) => { releaseCapture = () => resolve(fakeStream(['audio', 'video'])); }),
+  });
+
+  const app = new env.CallingApp();
+  const socket = env.lastSocket();
+  socket.open();
+  app.joinRoom('ROOM01');
+  socket.deliver({
+    type: 'joined',
+    roomId: 'ROOM01',
+    clientId: 'aaaa',
+    participants: [],
+    resumeToken: 'a'.repeat(64),
+  });
+  await tick();
+
+  socket.deliver({ type: 'peer-joined', clientId: 'zzzz' });
+  await tick();
+  assert.strictEqual(socket.sent.filter((m) => m.type === 'offer').length, 0, 'no offer before media');
+
+  releaseCapture();
+  await tick(50);
+
+  assert.strictEqual(socket.sent.filter((m) => m.type === 'offer').length, 1);
+  assert.ok(app.peerConnections.get('zzzz').senders.length > 0, 'the offer must carry local tracks');
+});
+
 test('an answer produced for a session we have replaced is ignored', async () => {
   const env = createBrowser();
   const { app, socket } = await joinedApp(env, { clientId: 'aaaa' });
