@@ -71,8 +71,16 @@ function join(client, roomId) {
   return nextMessage(client, 'joined');
 }
 
-function closed(client) {
-  return new Promise((resolve) => client.ws.on('close', (code) => resolve(code)));
+// Waiting on a close with no deadline turns "the guard regressed" into a hung
+// suite rather than a failure.
+function closed(client, timeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Timed out waiting for the connection to close')), timeoutMs);
+    client.ws.on('close', (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
 }
 
 const settle = (ms = 200) => new Promise((r) => setTimeout(r, ms));
@@ -513,9 +521,11 @@ test('oversize frames are rejected by the server', async () => {
 });
 
 test('WebSocket upgrades from a foreign origin are refused', async () => {
+  // The server writes 403 and destroys the socket, so the client may surface
+  // either the status line or a reset depending on timing.
   await assert.rejects(
     () => connect({ origin: 'https://evil.example' }),
-    /403|Unexpected server response/
+    /403|Unexpected server response|ECONNRESET|socket hang up/
   );
 });
 

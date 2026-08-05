@@ -21,6 +21,7 @@ const NEGOTIATION_WATCHDOG_MS = 8000;
 // throttle window is a minute, so a handful of attempts covers it.
 const REJOIN_RETRY_DELAY_MS = 15000;
 const MAX_REJOIN_RETRIES = 5;
+const CONFIG_FETCH_TIMEOUT_MS = 5000;
 
 const AUDIO_CONSTRAINTS = {
     echoCancellation: true,
@@ -304,8 +305,12 @@ class CallingApp {
     }
 
     async loadIceConfig() {
+        // Negotiation waits on this, so it must not be able to hang: a stalled
+        // request would stall every offer instead of falling back to STUN.
+        const abort = new AbortController();
+        const timer = setTimeout(() => abort.abort(), CONFIG_FETCH_TIMEOUT_MS);
         try {
-            const res = await fetch('/config');
+            const res = await fetch('/config', { signal: abort.signal });
             if (!res.ok) return;
             const cfg = await res.json();
             if (Array.isArray(cfg.iceServers) && cfg.iceServers.length > 0) {
@@ -317,6 +322,8 @@ class CallingApp {
             }
         } catch (error) {
             console.warn('Failed to load ICE config, using defaults:', error);
+        } finally {
+            clearTimeout(timer);
         }
     }
 

@@ -76,6 +76,9 @@ test('probing more distinct rooms than allowed is throttled per IP', async () =>
   client.ws.close();
 });
 
+// The two tests below deliberately run after the one above and depend on the
+// budget it consumed: the window is per IP and lasts a minute, and node:test
+// runs a file's tests in order.
 test('the throttle counts distinct rooms per IP, not per connection', async () => {
   // A second socket from the same source must not reset the budget.
   const client = await connect();
