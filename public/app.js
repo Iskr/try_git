@@ -1125,10 +1125,12 @@ class CallingApp {
 
         // Add local tracks; encryption transforms are installed up front and
         // stay in pass-through mode until encryption is enabled.
-        this.localStream.getTracks().forEach(track => {
-            const sender = pc.addTrack(track, this.localStream);
-            this.frameCryptor.setupSenderTransform(sender);
-        });
+        if (this.localStream) {
+            this.localStream.getTracks().forEach(track => {
+                const sender = pc.addTrack(track, this.localStream);
+                this.frameCryptor.setupSenderTransform(sender);
+            });
+        }
 
         // Whole-frame encryption is safe only for codecs whose RTP packetizer
         // treats the payload as opaque. H.264 packetization parses NAL units,
@@ -1384,9 +1386,21 @@ class CallingApp {
     }
 
     async createOffer(remoteClientId, options) {
+        await this._configPromise;
+        // A peer can be announced while our own capture is still waiting on
+        // the permission prompt, and a connection built without local tracks
+        // would carry no media.
+        if (!this.localStream) {
+            try {
+                await this.acquireLocalMedia();
+            } catch (error) {
+                console.error('Cannot offer without local media:', error);
+                return;
+            }
+        }
+
         // ICE restarts renegotiate the existing connection; everything else
         // starts a fresh one.
-        await this._configPromise;
         const pc = this.peerConnections.get(remoteClientId) && options && options.iceRestart
             ? this.peerConnections.get(remoteClientId)
             : this.createPeerConnection(remoteClientId);
