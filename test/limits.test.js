@@ -9,11 +9,22 @@ process.env.MAX_ROOMS_PER_IP_PER_MINUTE = '1000';
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert');
+const net = require('node:net');
+const crypto = require('node:crypto');
 const WebSocket = require('ws');
 
 const { server, stop, config } = require('../server');
 
 let wsUrl;
+
+// Waiting on an event with no deadline turns "the guard regressed" into a
+// hung suite instead of a failure.
+function withTimeout(promise, what, ms = 3000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out waiting for ${what}`)), ms)),
+  ]);
+}
 
 before(async () => {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -96,10 +107,55 @@ test('a single IP cannot hold more than MAX_CONNECTIONS_PER_IP sockets', async (
   for (let i = 0; i < config.MAX_CONNECTIONS_PER_IP; i++) {
     clients.push(await connect());
   }
+  // The ones inside the cap must survive — a server that rejected everything
+  // would otherwise satisfy the assertion below.
+  await new Promise((r) => setTimeout(r, 200));
+  assert.ok(
+    clients.every((c) => c.ws.readyState === WebSocket.OPEN),
+    'connections within the cap must stay open'
+  );
 
   const extra = await connect();
-  const code = await new Promise((resolve) => extra.ws.on('close', resolve));
-  assert.strictEqual(code, 1013);
+  const closed = new Promise((resolve) => extra.ws.on('close', resolve));
+  await withTimeout(closed, 'the socket over the cap is dropped');
+
+  clients.forEach((client) => client.ws.close());
+});
+
+test('a rejected connection cannot take the server down with a bad frame', async () => {
+  // The rejection path returns early from the 'connection' handler; if the
+  // 'error' listener is not installed before that, a protocol-illegal frame
+  // from the rejected socket becomes an uncaught exception and the process
+  // dies — a whole-service DoS from one host.
+  const clients = [];
+  for (let i = 0; i < config.MAX_CONNECTIONS_PER_IP; i++) {
+    clients.push(await connect());
+  }
+
+  const { port } = server.address();
+  const raw = net.connect(port, '127.0.0.1');
+  await new Promise((resolve) => raw.on('connect', resolve));
+  const key = crypto.randomBytes(16).toString('base64');
+  raw.write(
+    `GET / HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\n` +
+    `Connection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`
+  );
+  raw.on('error', () => { /* the server may reset us */ });
+  await new Promise((resolve) => {
+    raw.once('data', resolve);
+    raw.once('close', resolve);
+    setTimeout(resolve, 500);
+  });
+  // Unmasked client frame — illegal, and what makes ws emit 'error'
+  raw.write(Buffer.from([0x81, 0x01, 0x41]));
+  await new Promise((r) => setTimeout(r, 300));
+  raw.destroy();
+
+  // Still serving?
+  const survivor = await connect();
+  send(survivor, { type: 'ping' });
+  await nextMessage(survivor, 'pong');
+  survivor.ws.close();
 
   clients.forEach((client) => client.ws.close());
 });

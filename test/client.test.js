@@ -1,9 +1,13 @@
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert');
 
-const { createBrowser, joinedApp, fakeStream } = require('./helpers/browser-env');
+const { createBrowser, joinedApp, fakeStream, closeAll } = require('./helpers/browser-env');
 
 const tick = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Each app arms a heartbeat and reconnect timers; without this the process
+// idles for ~20s after the last assertion waiting for them to drain.
+after(() => closeAll());
 
 test('a missing camera falls back to an audio-only call instead of refusing to join', async () => {
   const env = createBrowser({
@@ -413,18 +417,36 @@ test('only one peer rekeys after a departure', async () => {
   );
 });
 
-test('reconnecting does not leave two live sockets racing', async () => {
+test('a socket still closing when we reconnect cannot trigger a second reconnect', async () => {
+  // A socket sits in CLOSING until the peer's close frame arrives. Reconnect
+  // during that window and the old socket's onclose would otherwise fire on a
+  // live app and schedule another connection — two sockets racing, each with
+  // its own heartbeat, and the loser's onclose tearing down the winner.
   const env = createBrowser();
   const { app } = await joinedApp(env, { clientId: 'aaaa' });
-  const before = env.sockets.length;
 
-  // Network comes back while a reconnect is already pending
-  env.lastSocket().close();
-  await tick();
+  const stale = env.lastSocket();
+  stale.beginClose();
   env.window.dispatchEvent(new env.window.Event('online'));
   await tick();
 
-  const live = env.sockets.filter((s) => s.readyState !== 3);
-  assert.ok(live.length <= 1, `expected at most one live socket, got ${live.length}`);
-  assert.ok(env.sockets.length > before);
+  const replacement = env.lastSocket();
+  assert.notStrictEqual(replacement, stale, 'a replacement socket is opened');
+  replacement.open();
+  const socketsAfterReconnect = env.sockets.length;
+  const status = env.document.getElementById('connection-status');
+
+  // The old socket finally finishes closing
+  stale.finishClose();
+  await tick(60);
+
+  // Its handler running would immediately advertise a reconnect and stop the
+  // heartbeat belonging to the socket that is actually live.
+  assert.notStrictEqual(status.textContent, 'Переподключение...', 'the stale handler must be inert');
+  assert.strictEqual(app.ws, replacement, 'the live socket is still the replacement');
+  assert.strictEqual(replacement.readyState, 1, 'and it was not closed by the stale handler');
+
+  // ...and no second connection appears once the reconnect backoff elapses
+  await tick(1300);
+  assert.strictEqual(env.sockets.length, socketsAfterReconnect, 'no extra socket was opened');
 });
