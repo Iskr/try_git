@@ -4,14 +4,63 @@ const path = require('path');
 const crypto = require('crypto');
 const WebSocket = require('ws');
 
-const PORT = parseInt(process.env.PORT, 10) || 3000;
-const MAX_PARTICIPANTS = parseInt(process.env.MAX_PARTICIPANTS, 10) || 5;
-const MAX_ROOMS = parseInt(process.env.MAX_ROOMS, 10) || 500;
-const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS, 10) || 2000;
+function intFromEnv(name, fallback, min) {
+  const parsed = parseInt(process.env[name], 10);
+  return Number.isFinite(parsed) && parsed >= (min || 0) ? parsed : fallback;
+}
+
+const PORT = intFromEnv('PORT', 3000, 1);
+const MAX_PARTICIPANTS = intFromEnv('MAX_PARTICIPANTS', 5, 2);
+const MAX_ROOMS = intFromEnv('MAX_ROOMS', 500, 1);
+const MAX_CONNECTIONS = intFromEnv('MAX_CONNECTIONS', 2000, 1);
+// Abuse limits are keyed on the client IP: a per-connection budget alone is
+// useless because an attacker simply opens more connections.
+const MAX_CONNECTIONS_PER_IP = intFromEnv('MAX_CONNECTIONS_PER_IP', 30, 1);
+// Room ids are only 6 chars, so the practical defence against enumeration is
+// capping how many *distinct* rooms one IP may touch per minute. Legitimate
+// users need a handful; a scanner needs thousands.
+const MAX_ROOMS_PER_IP_PER_MINUTE = intFromEnv('MAX_ROOMS_PER_IP_PER_MINUTE', 30, 1);
 const HEARTBEAT_INTERVAL_MS = 30000;
+// Sockets that connect but never join are dropped — they are either broken
+// clients or a cheap way to sit on the connection cap.
+const IDLE_TIMEOUT_MS = intFromEnv('IDLE_TIMEOUT_MS', 120000, 10000);
 const MAX_MESSAGE_BYTES = 64 * 1024;
+// A client that stops reading must not be able to make us buffer without
+// bound. Generous enough that a mobile client renegotiating on a bad link is
+// never hit by it.
+const MAX_BUFFERED_BYTES = intFromEnv('MAX_BUFFERED_BYTES', 1024 * 1024, 64 * 1024);
 // Messages per second a client may send before throttling; hard-close at 3x.
 const RATE_LIMIT_PER_SECOND = 50;
+const RATE_LIMIT_CLOSE_AFTER = 2 * RATE_LIMIT_PER_SECOND;
+// Number of proxy hops in front of us. Only trusted hops may set the client
+// IP — trusting X-Forwarded-For blindly would let an attacker forge a fresh
+// "IP" per connection and walk straight through the per-IP limits.
+const TRUST_PROXY = intFromEnv('TRUST_PROXY', process.env.NODE_ENV === 'production' ? 1 : 0);
+// Empty list means "same origin only".
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+// Native wrappers send no Origin header, so a missing one is allowed unless
+// the deployment opts into strictness.
+const REQUIRE_ORIGIN = process.env.REQUIRE_ORIGIN === '1';
+
+const LOG_LEVELS = { silent: 0, error: 1, warn: 2, info: 3, debug: 4 };
+const LOG_LEVEL = LOG_LEVELS[(process.env.LOG_LEVEL || 'info').toLowerCase()] ?? LOG_LEVELS.info;
+
+function logError(...args) {
+  if (LOG_LEVEL >= LOG_LEVELS.error) console.error(...args);
+}
+function logWarn(...args) {
+  if (LOG_LEVEL >= LOG_LEVELS.warn) console.warn(...args);
+}
+function logInfo(...args) {
+  if (LOG_LEVEL >= LOG_LEVELS.info) console.log(...args);
+}
+// Per-client events are attacker-paced, so they stay off by default.
+function logDebug(...args) {
+  if (LOG_LEVEL >= LOG_LEVELS.debug) console.log(...args);
+}
 
 const ROOM_ID_PATTERN = /^[A-Z0-9]{6}$/;
 const SIGNALING_TYPES = new Set(['offer', 'answer', 'ice-candidate']);
@@ -35,8 +84,18 @@ function verifyResumeToken(clientId, token) {
 
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', TRUST_PROXY);
 
 app.use((req, res, next) => {
+  // Same-origin ws(s) resolves under 'self' only in CSP3 browsers; naming the
+  // host keeps older WebKit working without opening the policy to every host.
+  const host = typeof req.headers.host === 'string' && /^[A-Za-z0-9.\-:[\]]+$/.test(req.headers.host)
+    ? req.headers.host
+    : null;
+  const connectSrc = host
+    ? `connect-src 'self' wss://${host} ws://${host}`
+    : "connect-src 'self'";
+
   res.setHeader(
     'Content-Security-Policy',
     [
@@ -44,8 +103,7 @@ app.use((req, res, next) => {
       "script-src 'self'",
       "style-src 'self'",
       "img-src 'self' data:",
-      // 'self' covers same-origin ws(s) only in CSP3 browsers; list schemes explicitly
-      "connect-src 'self' wss: ws:",
+      connectSrc,
       "media-src 'self' blob: mediastream:",
       "worker-src 'self'",
       "object-src 'none'",
@@ -58,19 +116,42 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), geolocation=()');
-  if (req.secure || req.headers['x-forwarded-proto'] === 'https') {
+  // req.secure already accounts for x-forwarded-proto through trusted hops
+  if (req.secure) {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   }
   next();
 });
 
 app.get('/health', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   res.status(200).json({
     status: 'ok',
     uptime: process.uptime(),
     rooms: rooms.size,
+    connections: wss.clients.size,
   });
 });
+
+// TURN credentials. When TURN_STATIC_AUTH_SECRET is set we hand out coturn
+// REST-style ephemeral credentials (`use-auth-secret`) so a leaked /config
+// response cannot be replayed as a free relay forever. Static
+// TURN_USERNAME/TURN_PASSWORD remain supported as a fallback.
+const TURN_CREDENTIAL_TTL_SECONDS = intFromEnv('TURN_CREDENTIAL_TTL_SECONDS', 6 * 3600, 300);
+
+function turnCredentials() {
+  const secret = process.env.TURN_STATIC_AUTH_SECRET;
+  if (!secret) {
+    return {
+      username: process.env.TURN_USERNAME || '',
+      credential: process.env.TURN_PASSWORD || '',
+    };
+  }
+  const expiry = Math.floor(Date.now() / 1000) + TURN_CREDENTIAL_TTL_SECONDS;
+  const username = `${expiry}:webrtc`;
+  const credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
+  return { username, credential };
+}
 
 // ICE servers are handed to clients from here so TURN credentials live in
 // environment variables instead of being hardcoded in the frontend.
@@ -88,26 +169,109 @@ app.get('/config', (req, res) => {
   if (process.env.TURN_SERVER_URL) {
     iceServers.push({
       urls: process.env.TURN_SERVER_URL.split(',').map((u) => u.trim()).filter(Boolean),
-      username: process.env.TURN_USERNAME || '',
-      credential: process.env.TURN_PASSWORD || '',
+      ...turnCredentials(),
     });
   }
 
+  // Credentials must never sit in a shared cache
+  res.setHeader('Cache-Control', 'no-store');
   res.json({ iceServers, maxParticipants: MAX_PARTICIPANTS });
 });
 
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
+// The app ships unversioned assets, so a long max-age would pair a fresh
+// index.html with a stale app.js after a deploy — i.e. an old client speaking
+// to a new protocol. 'no-cache' still allows 304s via ETag.
+app.use(
+  express.static(path.join(__dirname, 'public'), {
+    etag: true,
+    setHeaders: (res) => {
+      res.setHeader('Cache-Control', 'no-cache');
+    },
+  })
+);
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, maxPayload: MAX_MESSAGE_BYTES });
+const wss = new WebSocket.Server({ noServer: true, maxPayload: MAX_MESSAGE_BYTES });
 
 // Map<roomId, Map<clientId, ws>>
 const rooms = new Map();
+// Map<ip, connectionCount>
+const connectionsByIp = new Map();
+// Map<ip, { windowStart, rooms: Set<roomId> }>
+const joinsByIp = new Map();
+
+function clientIpFrom(req) {
+  const direct = (req.socket && req.socket.remoteAddress) || 'unknown';
+  if (TRUST_PROXY <= 0) {
+    return direct;
+  }
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded !== 'string') {
+    return direct;
+  }
+  const hops = forwarded.split(',').map((h) => h.trim()).filter(Boolean);
+  // Count back TRUST_PROXY hops from the right: entries further left are
+  // attacker-supplied and must not be trusted.
+  const index = hops.length - TRUST_PROXY;
+  return hops[index] || direct;
+}
+
+function originAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) {
+    return !REQUIRE_ORIGIN;
+  }
+  if (ALLOWED_ORIGINS.length > 0) {
+    return ALLOWED_ORIGINS.includes(origin);
+  }
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch (error) {
+    return false;
+  }
+}
+
+// A refill-free token bucket: no per-connection timer, state is advanced
+// lazily from the timestamp of the previous message.
+function takeToken(bucket, ratePerSecond, burst) {
+  const now = Date.now();
+  bucket.tokens = Math.min(burst, bucket.tokens + ((now - bucket.updatedAt) / 1000) * ratePerSecond);
+  bucket.updatedAt = now;
+  if (bucket.tokens < 1) {
+    return false;
+  }
+  bucket.tokens -= 1;
+  return true;
+}
+
+// Distinct rooms one IP may touch per minute.
+function allowRoomProbe(ip, roomId) {
+  const now = Date.now();
+  let entry = joinsByIp.get(ip);
+  if (!entry || now - entry.windowStart >= 60000) {
+    entry = { windowStart: now, rooms: new Set() };
+    joinsByIp.set(ip, entry);
+  }
+  if (entry.rooms.has(roomId)) {
+    return true;
+  }
+  if (entry.rooms.size >= MAX_ROOMS_PER_IP_PER_MINUTE) {
+    return false;
+  }
+  entry.rooms.add(roomId);
+  return true;
+}
 
 function sendTo(ws, message) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
+  if (ws.readyState !== WebSocket.OPEN) {
+    return;
   }
+  if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+    logWarn('Closing socket with a full send buffer');
+    ws.close(1013, 'Send buffer overflow');
+    return;
+  }
+  ws.send(JSON.stringify(message));
 }
 
 function sendError(ws, code, text) {
@@ -122,9 +286,14 @@ function broadcast(roomId, message, excludeId) {
 
   const messageStr = JSON.stringify(message);
   room.forEach((client, id) => {
-    if (id !== excludeId && client.readyState === WebSocket.OPEN) {
-      client.send(messageStr);
+    if (id === excludeId || client.readyState !== WebSocket.OPEN) {
+      return;
     }
+    if (client.bufferedAmount > MAX_BUFFERED_BYTES) {
+      client.close(1013, 'Send buffer overflow');
+      return;
+    }
+    client.send(messageStr);
   });
 }
 
@@ -137,6 +306,26 @@ function handleJoin(ws, state, rawRoomId) {
   const roomId = rawRoomId.trim().toUpperCase();
   if (!ROOM_ID_PATTERN.test(roomId)) {
     sendError(ws, 'invalid-room', 'Код звонка — 6 символов: буквы A-Z и цифры');
+    return;
+  }
+
+  if (!allowRoomProbe(state.ip, roomId)) {
+    sendError(ws, 'too-many-joins', 'Слишком много попыток. Подождите минуту.');
+    return;
+  }
+
+  // Re-joining the room this socket already occupies is a no-op: peers treat
+  // 'peer-joined' for a known id as "reconnected" and tear their session
+  // down, so re-broadcasting it would let a member spam renegotiations.
+  const currentRoom = rooms.get(roomId);
+  if (state.roomId === roomId && currentRoom && currentRoom.get(state.clientId) === ws) {
+    sendTo(ws, {
+      type: 'joined',
+      roomId,
+      clientId: state.clientId,
+      participants: Array.from(currentRoom.keys()).filter((id) => id !== state.clientId),
+      resumeToken: resumeTokenFor(state.clientId),
+    });
     return;
   }
 
@@ -165,6 +354,7 @@ function handleJoin(ws, state, rawRoomId) {
 
   room.set(state.clientId, ws);
   state.roomId = roomId;
+  state.everJoined = true;
 
   const participants = Array.from(room.keys()).filter((id) => id !== state.clientId);
 
@@ -178,7 +368,7 @@ function handleJoin(ws, state, rawRoomId) {
 
   broadcast(roomId, { type: 'peer-joined', clientId: state.clientId }, state.clientId);
 
-  console.log(`Client ${state.clientId} joined room ${roomId}. Total participants: ${room.size}`);
+  logDebug(`Client ${state.clientId} joined room ${roomId}. Total participants: ${room.size}`);
 }
 
 function handleSignaling(state, data) {
@@ -192,10 +382,15 @@ function handleSignaling(state, data) {
   }
 
   const targetClient = room.get(data.targetId);
-  if (targetClient && targetClient.readyState === WebSocket.OPEN) {
-    // senderId is always set server-side so clients cannot spoof it
-    targetClient.send(JSON.stringify({ ...data, senderId: state.clientId }));
+  if (!targetClient || targetClient.readyState !== WebSocket.OPEN) {
+    return;
   }
+  if (targetClient.bufferedAmount > MAX_BUFFERED_BYTES) {
+    targetClient.close(1013, 'Send buffer overflow');
+    return;
+  }
+  // senderId is always set server-side so clients cannot spoof it
+  targetClient.send(JSON.stringify({ ...data, senderId: state.clientId }));
 }
 
 function handleLeave(state) {
@@ -217,40 +412,67 @@ function handleLeave(state) {
 
   if (room.size === 0) {
     rooms.delete(roomId);
-    console.log(`Room ${roomId} deleted (empty)`);
+    logDebug(`Room ${roomId} deleted (empty)`);
   }
 
-  console.log(`Client ${clientId} left room ${roomId}`);
+  logDebug(`Client ${clientId} left room ${roomId}`);
 }
 
-wss.on('connection', (ws) => {
+server.on('upgrade', (req, socket, head) => {
+  if (!originAllowed(req)) {
+    logWarn(`Rejected WebSocket upgrade from origin: ${req.headers.origin}`);
+    socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
+wss.on('connection', (ws, req) => {
   if (wss.clients.size > MAX_CONNECTIONS) {
     ws.close(1013, 'Server overloaded');
     return;
   }
 
-  const state = { ws, clientId: crypto.randomUUID(), roomId: null };
+  const ip = clientIpFrom(req);
+  const perIp = (connectionsByIp.get(ip) || 0) + 1;
+  if (perIp > MAX_CONNECTIONS_PER_IP) {
+    logWarn(`Connection limit reached for ${ip}`);
+    ws.close(1013, 'Too many connections');
+    return;
+  }
+  connectionsByIp.set(ip, perIp);
+
+  const state = {
+    ws,
+    ip,
+    clientId: crypto.randomUUID(),
+    roomId: null,
+    everJoined: false,
+    connectedAt: Date.now(),
+  };
+  ws.state = state;
   ws.isAlive = true;
   ws.on('pong', () => {
     ws.isAlive = true;
   });
 
-  let messageBudget = RATE_LIMIT_PER_SECOND;
-  const refill = setInterval(() => {
-    messageBudget = RATE_LIMIT_PER_SECOND;
-  }, 1000);
+  const bucket = { tokens: RATE_LIMIT_PER_SECOND, updatedAt: Date.now() };
+  let rateViolations = 0;
 
-  console.log(`Client connected: ${state.clientId}`);
+  logDebug(`Client connected: ${state.clientId}`);
 
   ws.on('message', (message) => {
-    messageBudget -= 1;
-    if (messageBudget <= -2 * RATE_LIMIT_PER_SECOND) {
-      ws.close(1008, 'Rate limit exceeded');
+    if (!takeToken(bucket, RATE_LIMIT_PER_SECOND, RATE_LIMIT_PER_SECOND)) {
+      rateViolations += 1;
+      if (rateViolations > RATE_LIMIT_CLOSE_AFTER) {
+        ws.close(1008, 'Rate limit exceeded');
+      }
       return;
     }
-    if (messageBudget < 0) {
-      return;
-    }
+    rateViolations = 0;
 
     let data;
     try {
@@ -272,7 +494,11 @@ wss.on('connection', (ws) => {
       } else if (data.type === 'rejoin') {
         // Reuse the old clientId only when the resume token proves ownership;
         // otherwise fall back to a fresh identity.
-        if (verifyResumeToken(data.clientId, data.resumeToken)) {
+        if (verifyResumeToken(data.clientId, data.resumeToken) && data.clientId !== state.clientId) {
+          // Vacate the seat held under the current identity first, or the old
+          // entry is orphaned in the room map forever (the room then never
+          // empties and its slot is burned).
+          handleLeave(state);
           state.clientId = data.clientId;
         }
         handleJoin(ws, state, data.roomId);
@@ -283,45 +509,90 @@ wss.on('connection', (ws) => {
       }
       // Unknown message types are dropped silently.
     } catch (error) {
-      console.error('Error processing message:', error);
+      logError('Error processing message:', error);
     }
   });
 
   ws.on('close', () => {
-    clearInterval(refill);
-    console.log(`Client disconnected: ${state.clientId}`);
+    const remaining = (connectionsByIp.get(ip) || 1) - 1;
+    if (remaining > 0) {
+      connectionsByIp.set(ip, remaining);
+    } else {
+      connectionsByIp.delete(ip);
+    }
+    logDebug(`Client disconnected: ${state.clientId}`);
     handleLeave(state);
   });
 
   ws.on('error', (error) => {
-    console.error(`WebSocket error (${state.clientId}):`, error.message);
+    logWarn(`WebSocket error (${state.clientId}):`, error.message);
   });
 });
+
+// Drops room entries whose socket is gone. handleLeave covers the normal
+// paths; this is the safety net for anything that slipped through.
+function reapDeadEntries() {
+  rooms.forEach((room, roomId) => {
+    room.forEach((client, clientId) => {
+      if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
+        return;
+      }
+      room.delete(clientId);
+      broadcast(roomId, { type: 'peer-left', clientId }, clientId);
+    });
+    if (room.size === 0) {
+      rooms.delete(roomId);
+    }
+  });
+}
 
 // Terminate connections that stop answering pings so dead sockets do not
 // linger inside rooms (mobile clients drop without a close frame all the time).
 const heartbeat = setInterval(() => {
+  const now = Date.now();
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) {
       ws.terminate();
       return;
     }
+    const state = ws.state;
+    if (state && !state.everJoined && now - state.connectedAt > IDLE_TIMEOUT_MS) {
+      ws.close(1000, 'Idle');
+      return;
+    }
     ws.isAlive = false;
     ws.ping();
   });
+
+  reapDeadEntries();
+
+  joinsByIp.forEach((entry, ip) => {
+    if (now - entry.windowStart >= 120000) {
+      joinsByIp.delete(ip);
+    }
+  });
 }, HEARTBEAT_INTERVAL_MS);
+// Never let the heartbeat alone hold the event loop open — otherwise merely
+// requiring this module keeps a process alive forever.
+heartbeat.unref();
 
 wss.on('close', () => {
   clearInterval(heartbeat);
 });
 
-function shutdown(signal) {
-  console.log(`${signal} received, shutting down gracefully`);
+function stop() {
   clearInterval(heartbeat);
   wss.clients.forEach((ws) => ws.close(1001, 'Server shutting down'));
-  server.close(() => {
-    process.exit(0);
+  return new Promise((resolve) => {
+    wss.close(() => {
+      server.close(() => resolve());
+    });
   });
+}
+
+function shutdown(signal) {
+  logInfo(`${signal} received, shutting down gracefully`);
+  stop().then(() => process.exit(0));
   // Force exit if connections refuse to drain
   setTimeout(() => process.exit(1), 5000).unref();
 }
@@ -331,9 +602,24 @@ if (require.main === module) {
   process.on('SIGINT', () => shutdown('SIGINT'));
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Calling service running on port ${PORT}`);
-    console.log(`Health check: http://localhost:${PORT}/health`);
+    logInfo(`Calling service running on port ${PORT}`);
+    logInfo(`Health check: http://localhost:${PORT}/health`);
   });
 }
 
-module.exports = { app, server, wss, rooms };
+module.exports = {
+  app,
+  server,
+  wss,
+  rooms,
+  stop,
+  config: {
+    MAX_PARTICIPANTS,
+    MAX_ROOMS,
+    MAX_CONNECTIONS,
+    MAX_CONNECTIONS_PER_IP,
+    MAX_ROOMS_PER_IP_PER_MINUTE,
+    MAX_MESSAGE_BYTES,
+    RATE_LIMIT_PER_SECOND,
+  },
+};
