@@ -17,6 +17,10 @@ const MAX_FLYING_REACTIONS = 40;
 const MAX_PENDING_CANDIDATES = 60;
 // If the peer designated as offerer never offers, offer anyway after this.
 const NEGOTIATION_WATCHDOG_MS = 8000;
+// A rejoin refused by the per-IP throttle is retried on this backoff; the
+// throttle window is a minute, so a handful of attempts covers it.
+const REJOIN_RETRY_DELAY_MS = 15000;
+const MAX_REJOIN_RETRIES = 5;
 
 const AUDIO_CONSTRAINTS = {
     echoCancellation: true,
@@ -246,6 +250,9 @@ class CallingApp {
         // Single-flight guard for getUserMedia: two concurrent captures would
         // orphan one stream whose tracks keep the camera on and ignore mute.
         this._mediaPromise = null;
+        // Bumped whenever a call ends, so a capture still in flight knows its
+        // result is no longer wanted.
+        this._mediaGeneration = 0;
         // Peers whose offer we are waiting for, so a lost offer cannot stall
         // the pair forever. Map<clientId, timeoutId>
         this._negotiationTimers = new Map();
@@ -443,6 +450,9 @@ class CallingApp {
     connectWebSocket() {
         // Detach the previous socket first: its onclose would otherwise
         // schedule another reconnect and leave two live connections racing.
+        // Its heartbeat goes too — a pending pong timeout fires against
+        // this.ws, which by then is the new socket.
+        this._stopHeartbeat();
         if (this.ws) {
             this.ws.onopen = null;
             this.ws.onmessage = null;
@@ -517,6 +527,30 @@ class CallingApp {
                 this._scheduleReconnect();
             }
         };
+    }
+
+    // A rejoin refused for a transient reason (throttle, overloaded server).
+    // The seat is still ours, so wait it out instead of ending the call.
+    _retryRejoin() {
+        clearTimeout(this._rejoinRetryTimer);
+        this._rejoinRetryAttempt = (this._rejoinRetryAttempt || 0) + 1;
+        if (this._rejoinRetryAttempt > MAX_REJOIN_RETRIES) {
+            this._rejoining = false;
+            this.showToast('Не удалось вернуться в звонок');
+            this.endCall();
+            return;
+        }
+        this.updateConnectionStatus('Переподключение...', false);
+        this._rejoinRetryTimer = setTimeout(() => {
+            if (!this.roomId || !this.clientId || !this.resumeToken) return;
+            this._rejoining = true;
+            this._sendWs({
+                type: 'rejoin',
+                roomId: this.roomId,
+                clientId: this.clientId,
+                resumeToken: this.resumeToken
+            });
+        }, REJOIN_RETRY_DELAY_MS * this._rejoinRetryAttempt);
     }
 
     // Called whenever the page or the network comes back to life.
@@ -664,11 +698,17 @@ class CallingApp {
             case 'error':
                 this._joining = false;
                 this.showToast(message.text || 'Ошибка сервера');
-                // Only a failed rejoin is fatal; an unrelated mid-call error
-                // must not tear down a working call.
+                // Only a failed rejoin is fatal, and only when it failed for
+                // good: an unrelated mid-call error must not tear down a
+                // working call, and a throttle or an overloaded server is
+                // worth waiting out — the seat is still ours.
                 if (this._rejoining) {
-                    this._rejoining = false;
-                    this.endCall();
+                    if (message.code === 'too-many-joins' || message.code === 'server-busy') {
+                        this._retryRejoin();
+                    } else {
+                        this._rejoining = false;
+                        this.endCall();
+                    }
                 }
                 break;
         }
@@ -677,6 +717,8 @@ class CallingApp {
     async handleJoined(message) {
         this._joining = false;
         this._rejoining = false;
+        this._rejoinRetryAttempt = 0;
+        clearTimeout(this._rejoinRetryTimer);
         this.roomId = message.roomId;
         this.clientId = message.clientId;
         if (typeof message.resumeToken === 'string') {
@@ -823,6 +865,7 @@ class CallingApp {
             return this._mediaPromise;
         }
 
+        const generation = this._mediaGeneration;
         this._mediaPromise = (async () => {
             try {
                 return await navigator.mediaDevices.getUserMedia(MEDIA_CONSTRAINTS);
@@ -841,6 +884,13 @@ class CallingApp {
 
         this._mediaPromise
             .then((stream) => {
+                if (generation !== this._mediaGeneration) {
+                    // The call ended while the prompt was open. Adopting this
+                    // stream now would leave the camera running with nothing
+                    // on screen to explain why.
+                    stream.getTracks().forEach(t => t.stop());
+                    return;
+                }
                 if (this.localStream && this.localStream !== stream) {
                     this.localStream.getTracks().forEach(t => t.stop());
                 }
@@ -1289,9 +1339,14 @@ class CallingApp {
             case 'e2ee-off':
                 this.handleRemoteEncryptionDisabled(senderId);
                 break;
-            case 'e2ee-unsupported':
+            case 'e2ee-unsupported': {
+                // Remember it: such a peer can never rotate the key, so it
+                // must not win the rekey election when somebody leaves.
+                const participant = this.participants.get(senderId);
+                if (participant) participant.e2eeUnsupported = true;
                 this.showToast('⚠️ Браузер участника не поддерживает шифрование — его медиа скрыто');
                 break;
+            }
             case 'reaction':
                 this.handleRemoteReaction(senderId, message.emoji);
                 break;
@@ -1458,7 +1513,19 @@ class CallingApp {
                 // id wins as offerer; the other rolls back and answers.
                 const polite = this.clientId > message.senderId;
                 if (!polite) {
-                    console.log('Offer collision — ignoring remote offer (impolite peer)');
+                    // Re-assert our offer rather than just dropping theirs. If
+                    // our original offer was the one that went missing — which
+                    // is exactly why the other side offered — staying silent
+                    // here would deadlock the pair permanently.
+                    console.log('Offer collision — re-asserting our offer (impolite peer)');
+                    if (pc.localDescription) {
+                        this._sendWs({
+                            type: 'offer',
+                            offer: pc.localDescription,
+                            sessionId: pc._sessionId,
+                            targetId: message.senderId
+                        });
+                    }
                     return;
                 }
                 await pc.setLocalDescription({ type: 'rollback' });
@@ -1660,8 +1727,14 @@ class CallingApp {
     async rotateEncryptionKey() {
         if (!this.frameCryptor.encryptionEnabled) return;
         if (this.controlChannels.size === 0) return;
-        const remaining = Array.from(this.participants.keys()).sort();
-        if (remaining[0] !== this.clientId) return;
+        // A peer that cannot encrypt would never carry out the rotation, so
+        // electing it would silently leave the departed participant's key
+        // valid.
+        const eligible = Array.from(this.participants.values())
+            .filter(p => !p.e2eeUnsupported)
+            .map(p => p.id)
+            .sort();
+        if (eligible[0] !== this.clientId) return;
 
         try {
             await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
@@ -2085,6 +2158,9 @@ class CallingApp {
     }
 
     endCall() {
+        // Any capture still waiting on the permission prompt is now unwanted
+        this._mediaGeneration += 1;
+
         // Notify server first (teardown below closes nothing server-side)
         if (this.roomId) {
             this._sendWs({ type: 'leave' });
@@ -2116,6 +2192,8 @@ class CallingApp {
         this._lastRequestedRoom = null;
         this._joining = false;
         this._rejoining = false;
+        this._rejoinRetryAttempt = 0;
+        clearTimeout(this._rejoinRetryTimer);
         this._mediaPromise = null;
         this.participants.clear();
         this.isAudioEnabled = true;
