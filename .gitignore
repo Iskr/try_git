@@ -51,3 +51,9 @@ coverage/
 *.tmp
 *.temp
 .cache/
+
+# Working notes for AI sessions — scratchpads, not deliverables. HANDOFF.md
+# holds whatever is in progress right now and is rewritten constantly; keeping
+# it out of history stops it from being mistaken for documentation.
+HANDOFF.md
+CLAUDE.md

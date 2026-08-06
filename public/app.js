@@ -25,6 +25,10 @@ const CONFIG_FETCH_TIMEOUT_MS = 5000;
 // How long the room has to agree before a proposal to switch encryption off
 // lapses. Silence is a refusal, so this only ever fails closed.
 const E2EE_VOTE_TIMEOUT_MS = 20000;
+// How long the proposer waits for every peer to confirm it received the
+// result before giving up and re-asserting encryption. Confirmations are a
+// single hop over channels that were open moments ago, so this can be short.
+const E2EE_OFF_ACK_TIMEOUT_MS = 5000;
 // How long after cancelling a wait a 'joined' is still treated as the match we
 // backed out of rather than a call we asked for.
 const CANCELLED_MATCH_WINDOW_MS = 10000;
@@ -679,6 +683,12 @@ class CallingApp {
         this._agreedVotes = new Map();
         this._pendingVote = null;
         this._incomingVote = null;
+        // Set between a unanimous vote and everyone confirming they received
+        // the result. Applying the result locally before that would split the
+        // room whenever the announcement is lost: the peer that missed it
+        // keeps encrypting and drops everyone else's plaintext frames forever.
+        // { voteId, waiting: Set<clientId>, timer }
+        this._pendingDisable = null;
         // The room decided to be off. Without this, the next person to join —
         // or anyone's socket reconnecting — silently turns it back on for
         // everybody, which for the case it exists to serve (a participant who
@@ -1227,9 +1237,19 @@ class CallingApp {
         if (this._waitingSize) this._stopWaiting();
         clearTimeout(this._pendingVote && this._pendingVote.timer);
         this._pendingVote = null;
+        clearTimeout(this._pendingDisable && this._pendingDisable.timer);
+        this._pendingDisable = null;
         this._incomingVote = null;
         this._agreedVotes.clear();
         this._e2eeVotedOff = false;
+        // Reset alongside the vote state. Keeping a rejoiner's epoch while
+        // clearing _e2eeVotedOff is the worst combination: the silent enable
+        // below bumps the stale epoch past the room's, so the room's own
+        // "we voted off" bounce looks stale to us and everyone stays split.
+        // Starting from zero means the room always outranks a rejoiner, which
+        // is the right way round — it decided something we no longer remember.
+        this.keyEpoch = 0;
+        this.keyOwner = null;
         this._hideVotePrompt();
         this._rejoinRetryAttempt = 0;
         clearTimeout(this._rejoinRetryTimer);
@@ -1998,6 +2018,21 @@ class CallingApp {
         this.controlChannels.forEach((_, clientId) => this.sendControl(clientId, payload));
     }
 
+    // The current key under its (owner, epoch) label. `reenable` marks it as a
+    // deliberate turn-on, which a peer that believes the room voted off will
+    // follow instead of bouncing.
+    _sendCurrentKey(remoteClientId, options) {
+        if (!this.frameCryptor.encryptionEnabled || !this.frameCryptor.rawKeyData) return false;
+        const payload = {
+            kind: 'e2ee-key',
+            key: Array.from(this.frameCryptor.rawKeyData),
+            owner: this.keyOwner,
+            epoch: this.keyEpoch
+        };
+        if (options && options.reenable) payload.reenable = true;
+        return this.sendControl(remoteClientId, payload);
+    }
+
     async handleControlMessage(senderId, raw) {
         let message;
         try {
@@ -2009,15 +2044,31 @@ class CallingApp {
 
         switch (message.kind) {
             case 'e2ee-key':
-                await this.handleRemoteEncryptionKey(senderId, message.key, message.owner, message.epoch);
+                await this.handleRemoteEncryptionKey(senderId, message.key, message.owner,
+                    message.epoch, message.reenable === true);
                 break;
             case 'e2ee-off':
                 this.handleRemoteEncryptionDisabled(senderId, message);
                 break;
             case 'e2ee-room-off':
                 // From a member of a room that already voted encryption off.
-                // We are the newcomer here, so we follow the room.
+                // We are the newcomer here, so we follow the room — unless our
+                // key is newer than the vote the sender remembers, in which
+                // case the sender missed a later re-enable and following it
+                // would spread the stale state instead of the current one.
                 if (this.frameCryptor.encryptionEnabled && !this._e2eeVotedOff) {
+                    if (Number.isInteger(message.epoch) && this.keyEpoch > message.epoch) {
+                        // The sender is behind: bouncing an epoch older than
+                        // ours proves it never saw the re-enable that took us
+                        // past it. Merely ignoring it strands the pair — it
+                        // stays on plaintext we refuse to render, we stay on a
+                        // key it does not have, and no later event repairs it.
+                        // Hand over the current key as a deliberate re-enable,
+                        // which is the case that flag exists for.
+                        console.warn('Re-enabling a peer behind a stale e2ee-room-off:', senderId);
+                        this._sendCurrentKey(senderId, { reenable: true });
+                        break;
+                    }
                     this._applyDisableEncryption();
                     this.showToast('В этом звонке шифрование выключено по общему решению');
                 }
@@ -2027,6 +2078,9 @@ class CallingApp {
                 break;
             case 'e2ee-off-vote':
                 this.handleDisableVote(senderId, message);
+                break;
+            case 'e2ee-off-ack':
+                this.handleDisableAck(senderId, message);
                 break;
             case 'e2ee-unsupported': {
                 this._onPeerCannotEncrypt(senderId);
@@ -2328,7 +2382,7 @@ class CallingApp {
         return Boolean(this.keyOwner) && this.keyOwner < remoteOwner;
     }
 
-    async handleRemoteEncryptionKey(senderId, key, owner, epoch) {
+    async handleRemoteEncryptionKey(senderId, key, owner, epoch, reenable) {
         if (!Array.isArray(key) || key.length !== E2EE_KEY_BYTES ||
             !key.every(b => Number.isInteger(b) && b >= 0 && b <= 255)) {
             console.warn('Ignoring invalid encryption key from', senderId);
@@ -2342,10 +2396,18 @@ class CallingApp {
             return;
         }
         if (this._e2eeVotedOff) {
-            // Somebody joined and started encrypting again. Tell them what the
-            // room decided rather than quietly following them back on.
-            this.sendControl(senderId, { kind: 'e2ee-room-off' });
-            return;
+            if (reenable !== true) {
+                // Somebody joined and started encrypting again. Tell them what
+                // the room decided rather than quietly following them back on.
+                // The epoch dates our knowledge, so a peer that re-enabled
+                // after we went dark can tell our bounce is stale.
+                this.sendControl(senderId, { kind: 'e2ee-room-off', epoch: this.keyEpoch });
+                return;
+            }
+            // A deliberate re-enable — a user's choice, or the rollback of a
+            // disable whose result did not reach everyone — outranks the old
+            // vote. Turning encryption on never needs the room's permission.
+            this._e2eeVotedOff = false;
         }
         const keyOwner = typeof owner === 'string' && owner ? owner : senderId;
         const keyEpoch = Number.isInteger(epoch) && epoch > 0 ? epoch : 1;
@@ -2385,9 +2447,15 @@ class CallingApp {
     }
 
     handleRemoteEncryptionDisabled(senderId, message) {
-        if (!this.frameCryptor.encryptionEnabled) return;
         const voteId = message && message.voteId;
         if (typeof voteId !== 'string') return;
+        if (!this.frameCryptor.encryptionEnabled) {
+            // Already off — nothing to change, but the proposer is holding its
+            // own switch-off until everyone confirms receipt, so it must hear
+            // from us or it will roll the whole room back to encrypted.
+            this.sendControl(senderId, { kind: 'e2ee-off-ack', voteId });
+            return;
+        }
 
         const entry = this._agreedVotes.get(voteId);
         // Only the result of a vote we agreed to, announced by the peer we
@@ -2423,6 +2491,10 @@ class CallingApp {
         this._agreedVotes.delete(voteId);
         console.log('Encryption disabled by agreement, announced by:', senderId);
         this._applyDisableEncryption();
+        // The proposer only switches off once every recipient has confirmed;
+        // a lost confirmation costs a rollback, a lost announcement costs
+        // nothing worse.
+        this.sendControl(senderId, { kind: 'e2ee-off-ack', voteId });
     }
 
     handleRemoteMuteState(senderId, message) {
@@ -2791,6 +2863,9 @@ class CallingApp {
     async rotateEncryptionKey() {
         if (!this.frameCryptor.encryptionEnabled) return;
         if (this.controlChannels.size === 0) return;
+        // Mid-handover to the off state a rotation would hand voted-off peers
+        // a key they bounce; if the handover fails, its rollback rotates.
+        if (this._pendingDisable) return;
         // A peer that cannot encrypt would never carry out the rotation, so
         // electing it would silently leave the departed participant's key
         // valid.
@@ -2887,7 +2962,7 @@ class CallingApp {
     _onPeerCannotEncrypt(senderId) {
         if (!this.frameCryptor.encryptionEnabled) return;
         if (this.keyOwner !== this.clientId) return;
-        if (this._pendingVote) return;
+        if (this._pendingVote || this._pendingDisable) return;
         const who = this.participants.get(senderId);
         const name = who ? who.name : 'Участник';
         this.proposeDisableEncryption(`${name} не может шифровать и никого не увидит.`);
@@ -2900,14 +2975,22 @@ class CallingApp {
         await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
         this.keyOwner = this.clientId;
         this.keyEpoch += 1;
+        // Enabling is the one transition that never needs a vote, so it also
+        // ends our "the room is off" state — otherwise the room could never
+        // come back: every peer would bounce every key forever.
+        this._e2eeVotedOff = false;
         this.frameCryptor.enable();
         // The key travels only over DTLS-encrypted peer-to-peer data channels
-        // - the signaling server never sees it.
+        // - the signaling server never sees it. `reenable` lets it pull
+        // voted-off peers back on; during a join the channels are still empty,
+        // so a newcomer's default enable cannot override a room's vote (its
+        // keys go out via channel.onopen, without the flag).
         this.broadcastControl({
             kind: 'e2ee-key',
             key: Array.from(this.frameCryptor.rawKeyData),
             owner: this.keyOwner,
-            epoch: this.keyEpoch
+            epoch: this.keyEpoch,
+            reenable: true
         });
         this.updateEncryptionUI(true);
         if (!(options && options.silent)) this.showToast('\u{1F512} Шифрование включено');
@@ -2929,7 +3012,7 @@ class CallingApp {
     // Switching encryption off is the whole room's decision, so it is put to
     // the others and only carried out if every one of them agrees.
     proposeDisableEncryption(reason) {
-        if (this._pendingVote) {
+        if (this._pendingVote || this._pendingDisable) {
             this.showToast('Голосование уже идёт');
             return;
         }
@@ -2967,6 +3050,16 @@ class CallingApp {
         if (typeof message.voteId !== 'string' || !message.voteId) return;
         if (!this.frameCryptor.encryptionEnabled) {
             // Nothing to turn off; agreeing costs nothing and unblocks them.
+            // Deliberately NOT recorded as an agreement. This branch answers
+            // without asking the user, so a stored "yes" would be a consent
+            // token nobody granted: a peer could keep re-sending requests
+            // while we are off, refreshing the token, and spend it the moment
+            // encryption returns to put us back on plaintext with no prompt.
+            // There is nothing to lose by not recording it — we have nothing
+            // to switch off, the result gets acknowledged anyway by the
+            // already-off branch of handleRemoteEncryptionDisabled, and if
+            // encryption does come back before the result then refusing it is
+            // the right answer: the proposer's rollback re-encrypts the room.
             this.sendControl(senderId, { kind: 'e2ee-off-vote', voteId: message.voteId, agree: true });
             return;
         }
@@ -3014,15 +3107,88 @@ class CallingApp {
 
         clearTimeout(vote.timer);
         this._pendingVote = null;
-        this.broadcastControl({
+        const announcement = {
             kind: 'e2ee-off',
             voteId: vote.voteId,
             // Who was asked and who agreed, so a recipient can check the vote
             // covered its own view of the room instead of taking our word.
             peers: [this.clientId, ...vote.peers],
             agreed: [this.clientId, ...vote.agreed],
+        };
+        // We do not switch off with the announcement: whoever misses it would
+        // stay encrypted alone, dropping everyone's plaintext frames behind a
+        // lock indicator, and nothing would ever repair that. Off happens only
+        // once every voter has confirmed the result reached them.
+        this._pendingDisable = {
+            voteId: vote.voteId,
+            waiting: new Set(vote.peers),
+            timer: setTimeout(() => this._abortPendingDisable(), E2EE_OFF_ACK_TIMEOUT_MS),
+        };
+        let allSent = true;
+        vote.peers.forEach((id) => {
+            if (!this.sendControl(id, announcement)) allSent = false;
         });
-        this._applyDisableEncryption();
+        // A channel that has already closed can never confirm — fail now
+        // rather than let the timeout discover it.
+        if (!allSent) this._abortPendingDisable();
+    }
+
+    handleDisableAck(senderId, message) {
+        const pending = this._pendingDisable;
+        if (!pending || message.voteId !== pending.voteId) return;
+        if (!pending.waiting.delete(senderId)) return;
+        if (pending.waiting.size > 0) return;
+        clearTimeout(pending.timer);
+        this._pendingDisable = null;
+        this._agreedVotes.delete(pending.voteId);
+        // Crossed proposals: each side agreed to the other's vote, so this
+        // peer may already have applied the other result. Applying again only
+        // repeats the toast, but there is nothing to apply.
+        if (this.frameCryptor.encryptionEnabled) this._applyDisableEncryption();
+    }
+
+    // The result did not reach somebody who agreed. They may have switched
+    // off already, so staying quiet is not an option: the room is pulled back
+    // to the encrypted state it never fully left, and told.
+    _abortPendingDisable() {
+        const pending = this._pendingDisable;
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this._pendingDisable = null;
+        this._agreedVotes.delete(pending.voteId);
+        this.showToast('Результат не дошёл до всех участников — шифрование остаётся включённым');
+        this._reassertEncryption();
+    }
+
+    // A fresh key under a bumped epoch, marked as a deliberate re-enable so
+    // it outranks both stale keys and a voted-off peer's refusal to follow
+    // plain ones.
+    async _reassertEncryption() {
+        if (!this.frameCryptor.supported) return;
+        // The call can end while the key is being imported. Coming back to
+        // enable() afterwards would re-arm a cryptor endCall just reset, and
+        // the next call would skip minting a key because encryption already
+        // looks on — leaving it encrypting with a key it never announced.
+        const generation = this._mediaGeneration;
+        try {
+            await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
+        } catch (error) {
+            console.error('Failed to re-assert encryption:', error);
+            return;
+        }
+        if (!this.roomId || generation !== this._mediaGeneration) return;
+        this.keyOwner = this.clientId;
+        this.keyEpoch += 1;
+        this._e2eeVotedOff = false;
+        this.frameCryptor.enable();
+        this.updateEncryptionUI(true);
+        this.broadcastControl({
+            kind: 'e2ee-key',
+            key: Array.from(this.frameCryptor.rawKeyData),
+            owner: this.keyOwner,
+            epoch: this.keyEpoch,
+            reenable: true,
+        });
     }
 
     // Whatever this peer asked us or promised us dies with it. Otherwise a
@@ -3038,6 +3204,17 @@ class CallingApp {
         }
         if (this._pendingVote && this._pendingVote.peers.has(peerId)) {
             this._failVote('Участник вышел — голосование отменено');
+        }
+        // A voter that leaves before confirming no longer needs the result;
+        // everyone still here has confirmed theirs, so the room is not split
+        // by honouring what it unanimously asked for.
+        if (this._pendingDisable && this._pendingDisable.waiting.delete(peerId) &&
+            this._pendingDisable.waiting.size === 0) {
+            clearTimeout(this._pendingDisable.timer);
+            const { voteId } = this._pendingDisable;
+            this._pendingDisable = null;
+            this._agreedVotes.delete(voteId);
+            this._applyDisableEncryption();
         }
     }
 
@@ -3413,6 +3590,18 @@ class CallingApp {
         // Reset encryption completely — the next call gets a fresh key
         this.frameCryptor.reset();
         this.updateEncryptionUI(false);
+
+        // No vote state may outlive the call. The rollback timer is the
+        // dangerous one: firing on the home screen it would re-arm the
+        // cryptor with this call's key, and the next call — seeing encryption
+        // already on — would inherit a key the old room knows.
+        clearTimeout(this._pendingVote && this._pendingVote.timer);
+        this._pendingVote = null;
+        clearTimeout(this._pendingDisable && this._pendingDisable.timer);
+        this._pendingDisable = null;
+        this._incomingVote = null;
+        this._agreedVotes.clear();
+        this._hideVotePrompt();
 
         // Reset state
         this.roomId = null;

@@ -1120,12 +1120,12 @@ test('a refusal keeps encryption on', async () => {
   assert.match(env.document.getElementById('toast').textContent, /против/i);
 });
 
-test('unanimous agreement switches it off', async () => {
+test('unanimous agreement switches it off once everyone confirms receipt', async () => {
   const env = createBrowser({ frameEncryption: true });
   const { app } = await joinedApp(env, { clientId: 'aaaa' });
   ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
   const first = attachControlChannel(app, 'mmmm');
-  attachControlChannel(app, 'zzzz');
+  const second = attachControlChannel(app, 'zzzz');
 
   app.proposeDisableEncryption();
   const request = first.find((m) => m.kind === 'e2ee-off-request');
@@ -1139,8 +1139,508 @@ test('unanimous agreement switches it off', async () => {
     kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
   }));
 
-  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
   assert.ok(first.some((m) => m.kind === 'e2ee-off' && m.voteId === request.voteId));
+  assert.ok(second.some((m) => m.kind === 'e2ee-off' && m.voteId === request.voteId));
+  // The announcement can be lost; whoever misses it stays encrypted alone and
+  // sees nothing but frozen tiles. So the proposer holds its own switch-off
+  // until every voter confirms the result actually reached them.
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'delivery is not confirmed yet');
+
+  await app.handleControlMessage('mmmm', JSON.stringify({
+    kind: 'e2ee-off-ack', voteId: request.voteId,
+  }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'one confirmation is not everyone');
+
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-ack', voteId: request.voteId,
+  }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+});
+
+test('a result nobody confirms rolls the room back to encrypted', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = outbox.find((m) => m.kind === 'e2ee-off-request');
+  const epochBefore = app.keyEpoch;
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+  }));
+  assert.ok(outbox.some((m) => m.kind === 'e2ee-off'), 'the result went out');
+  assert.ok(app._pendingDisable, 'and delivery is being confirmed');
+  assert.ok(app._pendingDisable.timer, 'with a rollback armed for silence');
+
+  // The confirmation never arrives — the ack window closes
+  app._abortPendingDisable();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+  assert.strictEqual(app._pendingDisable, null);
+  // zzzz may have applied the result before its ack was lost, so silence
+  // would leave it on plaintext: the room is actively re-keyed instead.
+  const rekey = outbox.filter((m) => m.kind === 'e2ee-key').pop();
+  assert.ok(rekey, 'the room is pulled back to encrypted');
+  assert.strictEqual(rekey.reenable, true, 'as a deliberate re-enable, so a voted-off peer follows it');
+  assert.ok(rekey.epoch > epochBefore, 'under a fresh epoch that outranks the old key');
+  assert.match(env.document.getElementById('toast').textContent, /не дошёл/i);
+});
+
+test('a result that cannot even be sent fails the switch-off at once', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
+  const open = attachControlChannel(app, 'mmmm');
+  attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = open.find((m) => m.kind === 'e2ee-off-request');
+  await app.handleControlMessage('mmmm', JSON.stringify({
+    kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+  }));
+  // zzzz's channel dies between its vote and the announcement
+  app.controlChannels.get('zzzz').readyState = 'closed';
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'nobody is switched off over a dead channel');
+  assert.strictEqual(app._pendingDisable, null, 'no point waiting out the ack window');
+  const rekey = open.filter((m) => m.kind === 'e2ee-key').pop();
+  assert.ok(rekey && rekey.reenable === true, 'mmmm, who may have applied the result, is pulled back');
+});
+
+test('an auto-agreement mints no consent token that survives encryption coming back', async () => {
+  // The auto-agree branch answers without asking the user, so a stored "yes"
+  // would be consent nobody gave: a peer could keep re-sending requests while
+  // we are off — refreshing the entry each time — and spend it the moment
+  // encryption returns, putting us on plaintext with no prompt ever shown.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  app.frameCryptor.disable();
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off-request', voteId: 'v7' }));
+  const reply = outbox.find((m) => m.kind === 'e2ee-off-vote');
+  assert.ok(reply && reply.agree === true, 'still agreed — there is nothing to turn off');
+  assert.strictEqual(app._agreedVotes.has('v7'), false, 'but nothing spendable is kept');
+
+  // Encryption comes back (the user's own choice, or a rollback's re-enable)
+  await app.enableEncryption({ silent: true });
+  await app.handleControlMessage('aaaa', JSON.stringify({
+    kind: 'e2ee-off', voteId: 'v7', peers: ['aaaa', 'zzzz'], agreed: ['aaaa', 'zzzz'],
+  }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true,
+    'the old vote cannot be cashed in against the new state');
+  assert.strictEqual(outbox.filter((m) => m.kind === 'e2ee-off-ack').length, 0,
+    'and withholding the ack rolls the proposer back, so the room stays encrypted');
+});
+
+test('the ack window closing is what fires the rollback', async () => {
+  // Asserting the timer field is truthy proves nothing: a no-op callback or a
+  // 20s constant would pass while the proposer hung in _pendingDisable
+  // forever, blocking every later vote and every key rotation.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'zzzz');
+
+  const armed = [];
+  const realSetTimeout = env.window.setTimeout;
+  env.window.setTimeout = function (fn, ms, ...args) {
+    const id = realSetTimeout.call(env.window, fn, ms, ...args);
+    armed.push({ fn, ms, id });
+    return id;
+  };
+
+  app.proposeDisableEncryption();
+  const request = outbox.find((m) => m.kind === 'e2ee-off-request');
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+  }));
+
+  const rollback = armed.find((t) => t.id === app._pendingDisable.timer);
+  assert.ok(rollback, 'the handover armed its rollback through the platform timer');
+  assert.strictEqual(rollback.ms, 5000, 'over the documented ack window');
+
+  const epochBefore = app.keyEpoch;
+  rollback.fn(); // the window elapses with nobody confirming
+  await tick(10);
+
+  assert.strictEqual(app._pendingDisable, null);
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+  const rekey = outbox.filter((m) => m.kind === 'e2ee-key').pop();
+  assert.ok(rekey && rekey.reenable === true, 'and that callback is the one that re-keys the room');
+  assert.ok(rekey.epoch > epochBefore);
+});
+
+test('a stale or forged confirmation cannot spend the handover', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
+  const first = attachControlChannel(app, 'mmmm');
+  attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = first.find((m) => m.kind === 'e2ee-off-request');
+  for (const id of ['mmmm', 'zzzz']) {
+    await app.handleControlMessage(id, JSON.stringify({
+      kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+    }));
+  }
+
+  // A confirmation carrying some other vote's id must not be counted as this
+  // one. Checking only that the handover has not completed would miss it: the
+  // damage is that it silently spends mmmm's slot, so the next voter alone
+  // finishes a handover mmmm never confirmed.
+  await app.handleControlMessage('mmmm', JSON.stringify({ kind: 'e2ee-off-ack', voteId: 'other' }));
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-ack', voteId: request.voteId,
+  }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true,
+    'mmmm has not confirmed anything about this vote');
+  assert.ok(app._pendingDisable, 'so the handover is still waiting on it');
+
+  // mmmm confirming for real is what finishes it
+  await app.handleControlMessage('mmmm', JSON.stringify({
+    kind: 'e2ee-off-ack', voteId: request.voteId,
+  }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+});
+
+test('a confirmation arriving after the rollback cannot revive the handover', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
+  const first = attachControlChannel(app, 'mmmm');
+  attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = first.find((m) => m.kind === 'e2ee-off-request');
+  for (const id of ['mmmm', 'zzzz']) {
+    await app.handleControlMessage(id, JSON.stringify({
+      kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+    }));
+  }
+
+  // The window closes with nobody confirming; the room is re-keyed
+  app._abortPendingDisable();
+  await tick(10);
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+
+  // Both confirmations were merely slow. Honouring them now would put us on
+  // plaintext in a room we just told everyone stays encrypted.
+  for (const id of ['mmmm', 'zzzz']) {
+    await app.handleControlMessage(id, JSON.stringify({
+      kind: 'e2ee-off-ack', voteId: request.voteId,
+    }));
+  }
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'a spent handover stays spent');
+});
+
+test('a peer left behind by a re-enable is handed the key instead of being stranded', async () => {
+  // It bounces e2ee-room-off at an epoch below ours, which proves it never saw
+  // the re-enable. Ignoring that leaves it on plaintext we refuse to render
+  // and us on a key it does not have, with nothing to ever repair it.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'zzzz');
+
+  await app.handleRemoteEncryptionKey('zzzz', keyOf(5), 'zzzz', 5);
+  assert.strictEqual(app.keyEpoch, 5);
+
+  outbox.length = 0;
+  await app.handleControlMessage('zzzz', JSON.stringify({ kind: 'e2ee-room-off', epoch: 4 }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'we do not follow stale news');
+  const rescue = outbox.find((m) => m.kind === 'e2ee-key');
+  assert.ok(rescue, 'the peer behind us is given the current key');
+  assert.strictEqual(rescue.reenable, true, 'marked so its voted-off state does not bounce it again');
+  assert.strictEqual(rescue.epoch, 5);
+});
+
+test('rejoining does not let a stale epoch outrank the room', async () => {
+  // A rejoin clears _e2eeVotedOff and silently re-enables. Keeping the old
+  // epoch would push us past the room's, so the room's own "we voted off"
+  // bounce would look stale to us and the split would never heal.
+  const env = createBrowser({ frameEncryption: true });
+  const { app, socket } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  attachControlChannel(app, 'zzzz');
+
+  await app.handleRemoteEncryptionKey('zzzz', keyOf(6), 'zzzz', 9);
+  assert.strictEqual(app.keyEpoch, 9);
+
+  socket.deliver({
+    type: 'joined',
+    roomId: 'ROOM01',
+    clientId: 'aaaa',
+    participants: [],
+    resumeToken: 'a'.repeat(64),
+  });
+  await tick(20);
+  assert.strictEqual(app._pendingDisable, null, 'no handover survives the rejoin');
+  assert.strictEqual(app._agreedVotes.size, 0);
+
+  // The room tells us what it decided while we were away. Keeping epoch 9
+  // would make that look like stale news from behind us, and we would answer
+  // by pushing our key back at the room — overriding a decision we never
+  // took part in, and splitting off for the rest of the call.
+  const outbox = attachControlChannel(app, 'zzzz');
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  await app.handleControlMessage('zzzz', JSON.stringify({ kind: 'e2ee-room-off', epoch: 1 }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false, 'the rejoiner follows the room');
+  assert.strictEqual(
+    outbox.filter((m) => m.kind === 'e2ee-key').length, 0,
+    'and does not try to re-enable the room on its way in'
+  );
+});
+
+test('a rollback that lands after the call ended does not re-arm the cryptor', async () => {
+  // _reassertEncryption awaits importKey; endCall can run in that gap. Coming
+  // back to enable() would leave the next call encrypting with a key it never
+  // announced, because it would see encryption as already on.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  attachControlChannel(app, 'zzzz');
+
+  const reassert = app._reassertEncryption();
+  app.endCall();
+  await reassert;
+  await tick(10);
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+  assert.strictEqual(app.frameCryptor.rawKeyData, null, 'the reset stands');
+});
+
+test('ending the call clears a vote that never reached a result', async () => {
+  // The other half of endCall's cleanup: without it the 20s vote timer fires
+  // on the home screen and toasts about a call that is over.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
+  attachControlChannel(app, 'mmmm');
+  attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  assert.ok(app._pendingVote, 'nobody has voted yet');
+
+  app.endCall();
+
+  assert.strictEqual(app._pendingVote, null);
+  assert.strictEqual(app._agreedVotes.size, 0);
+});
+
+test('the deferred rotation resumes once the handover has failed', async () => {
+  // The deferral must be a pause, not a latch: after a rollback a later
+  // departure has to rotate the key as usual.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
+  const first = attachControlChannel(app, 'mmmm');
+  attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = first.find((m) => m.kind === 'e2ee-off-request');
+  for (const id of ['mmmm', 'zzzz']) {
+    await app.handleControlMessage(id, JSON.stringify({
+      kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+    }));
+  }
+  app._abortPendingDisable();
+  await tick(10);
+  const afterRollback = app.keyEpoch;
+
+  first.length = 0;
+  app.handlePeerLeft('zzzz');
+  await tick(20);
+
+  const rotated = first.filter((m) => m.kind === 'e2ee-key').pop();
+  assert.ok(rotated, 'a departure still rotates the key');
+  assert.ok(rotated.epoch > afterRollback, 'under a fresh epoch');
+});
+
+test('a recipient confirms the result it applied', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off-request', voteId: 'v9' }));
+  app.answerDisableRequest(true);
+  await app.handleControlMessage('aaaa', JSON.stringify({
+    kind: 'e2ee-off', voteId: 'v9', peers: ['aaaa', 'zzzz'], agreed: ['aaaa', 'zzzz'],
+  }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+  assert.ok(outbox.some((m) => m.kind === 'e2ee-off-ack' && m.voteId === 'v9'));
+});
+
+test('an already-off recipient still confirms receipt of the result', async () => {
+  // Without this the proposer would wait for an ack that can never come and
+  // roll the whole room back to encrypted for no reason — including the peer
+  // the vote was held for, who would vanish again.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  app.frameCryptor.disable();
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off', voteId: 'v8' }));
+
+  assert.ok(outbox.some((m) => m.kind === 'e2ee-off-ack' && m.voteId === 'v8'));
+});
+
+test('a voter leaving before confirming does not hold the switch-off hostage', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
+  const first = attachControlChannel(app, 'mmmm');
+  attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = first.find((m) => m.kind === 'e2ee-off-request');
+  for (const id of ['mmmm', 'zzzz']) {
+    await app.handleControlMessage(id, JSON.stringify({
+      kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+    }));
+  }
+  await app.handleControlMessage('mmmm', JSON.stringify({
+    kind: 'e2ee-off-ack', voteId: request.voteId,
+  }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'zzzz has not confirmed');
+
+  // zzzz leaves without confirming; everyone still here has
+  app.handlePeerLeft('zzzz');
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false, 'the room honours what it agreed');
+});
+
+test('key rotation waits while a switch-off result is in flight', async () => {
+  // A rotation broadcast mid-handover would hand a fresh key to peers that
+  // just switched off; they bounce it and the room drifts apart again.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
+  const first = attachControlChannel(app, 'mmmm');
+  const second = attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = first.find((m) => m.kind === 'e2ee-off-request');
+  for (const id of ['mmmm', 'zzzz']) {
+    await app.handleControlMessage(id, JSON.stringify({
+      kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+    }));
+  }
+  await app.handleControlMessage('mmmm', JSON.stringify({
+    kind: 'e2ee-off-ack', voteId: request.voteId,
+  }));
+
+  // mmmm (already confirmed) leaves; zzzz is still being waited on, and we
+  // are the lowest remaining id — the usual trigger for a rekey
+  app.handlePeerLeft('mmmm');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.strictEqual(second.filter((m) => m.kind === 'e2ee-key').length, 0, 'no rekey mid-handover');
+  assert.ok(app._pendingDisable, 'the handover itself is unaffected');
+
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-ack', voteId: request.voteId,
+  }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+});
+
+test('a deliberate re-enable pulls a voted-off peer back on', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  app._applyDisableEncryption();
+
+  // A plain key is still bounced — a newcomer must not override the room…
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(3), 'aaaa', 3);
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+  const bounce = outbox.find((m) => m.kind === 'e2ee-room-off');
+  assert.ok(bounce, 'the sender is told what the room decided');
+  assert.strictEqual(bounce.epoch, app.keyEpoch, 'dated, so a later re-enable can tell it is stale');
+
+  // …but a deliberate re-enable is the room coming back on
+  await app.handleRemoteEncryptionKey('aaaa', keyOf(4), 'aaaa', 4, true);
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+  assert.strictEqual(app._e2eeVotedOff, false);
+});
+
+test('a stale room-off bounce cannot drag a re-keyed room back to plaintext', async () => {
+  // A peer that went dark holding "the room voted off at epoch N" must not
+  // undo a re-enable it never saw when it comes back.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  attachControlChannel(app, 'zzzz');
+
+  await app.handleRemoteEncryptionKey('zzzz', keyOf(5), 'zzzz', 5);
+  assert.strictEqual(app.keyEpoch, 5);
+
+  await app.handleControlMessage('zzzz', JSON.stringify({ kind: 'e2ee-room-off', epoch: 4 }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'its news is older than our key');
+
+  // The same claim about the current epoch is followed as before
+  await app.handleControlMessage('zzzz', JSON.stringify({ kind: 'e2ee-room-off', epoch: 5 }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+});
+
+test('ending the call disarms a pending vote and result handover', async () => {
+  // The rollback timer must not outlive the call: firing on the home screen
+  // it would re-arm the cryptor with the old room's key, and the next call —
+  // seeing encryption already on — would inherit a key strangers know.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = outbox.find((m) => m.kind === 'e2ee-off-request');
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+  }));
+  assert.ok(app._pendingDisable, 'the handover is in flight');
+
+  app.endCall();
+
+  assert.strictEqual(app._pendingDisable, null);
+  assert.strictEqual(app._agreedVotes.size, 0);
+  // Even if the armed callback still fired, it must find nothing to do
+  app._abortPendingDisable();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false,
+    'the cryptor stays reset for the next call');
+});
+
+test('toggling encryption back on ends the voted-off state for the room', async () => {
+  // Without clearing _e2eeVotedOff the toggler comes back alone: every other
+  // peer bounces its key and the room splits between one encrypted member
+  // and everyone else on plaintext.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'zzzz');
+
+  app._applyDisableEncryption();
+  await app.toggleEncryption();
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+  assert.strictEqual(app._e2eeVotedOff, false);
+  const rekey = outbox.filter((m) => m.kind === 'e2ee-key').pop();
+  assert.ok(rekey && rekey.reenable === true, 'sent as a re-enable so voted-off peers follow it');
 });
 
 test('we only switch off for a vote we agreed to ourselves', async () => {
