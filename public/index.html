@@ -45,6 +45,9 @@
                        spellcheck="false" aria-label="Код звонка" />
                 <button id="join-submit-btn" class="btn btn-primary">Войти</button>
             </div>
+
+            <!-- Shown only where the browser cannot get a camera at all -->
+            <div id="env-notice" class="env-notice hidden" role="alert"></div>
         </div>
 
         <!-- Call Screen -->
@@ -71,20 +74,7 @@
                             <rect x="3" y="14" width="7" height="7"></rect>
                         </svg>
                     </button>
-                    <!-- Not in the .controls bar: a sixth round button overflows
-                         a 360px viewport, which has no flex-wrap. -->
-                    <button id="game-btn" class="icon-btn" title="Пинг-понг" aria-label="Играть в пинг-понг">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <circle cx="12" cy="12" r="9"></circle>
-                            <path d="M8 3.5c2.5 3 3.5 6 3.5 8.5S10.5 17.5 8 20.5"></path>
-                            <circle cx="16" cy="9" r="1.6" fill="currentColor" stroke="none"></circle>
-                        </svg>
-                    </button>
                 </div>
-
-                <!-- Opponent picker, shown only when the call has more than one
-                     other participant. Mirrors the layout selector. -->
-                <div id="game-menu" class="game-menu hidden" role="menu" aria-label="Выбор соперника"></div>
                 <div class="status-bar">
                     <div class="connection-status" id="connection-status">Подключение...</div>
                     <div class="encryption-indicator hidden" id="encryption-indicator">
@@ -145,44 +135,6 @@
                 <!-- Video streams will be added dynamically -->
             </div>
 
-            <!-- Ping-pong. A sibling of the video container, never a child of
-                 it: updateGridLayout() counts that container's children, so a
-                 board inside it would shift every layout rule. -->
-            <div id="game-panel" class="game-panel hidden" data-state="waiting">
-                <div class="game-scoreboard">
-                    <span class="game-score-side">
-                        <span class="game-score-name">Вы</span>
-                        <span class="game-score-value" id="game-score-you">0</span>
-                    </span>
-                    <span class="game-score-sep">:</span>
-                    <span class="game-score-side">
-                        <span class="game-score-value" id="game-score-them">0</span>
-                        <span class="game-score-name" id="game-opponent-name">Соперник</span>
-                    </span>
-                </div>
-                <div class="game-board" id="game-board">
-                    <canvas id="game-canvas" class="game-canvas" width="300" height="400"></canvas>
-                    <div class="game-message hidden" id="game-message"></div>
-                </div>
-                <div class="game-bar">
-                    <span class="game-hint">Ведите пальцем или стрелками ← →</span>
-                    <button id="game-exit-btn" class="game-bar-btn" aria-label="Выйти из игры">Выйти</button>
-                </div>
-            </div>
-
-            <!-- Incoming invitation. Not a toast: .toast is pointer-events:none
-                 and self-hides, so it cannot hold buttons. -->
-            <div id="game-invite" class="game-invite hidden" role="dialog" aria-live="polite">
-                <div class="game-invite-text">
-                    <strong>Пинг-понг</strong>
-                    <span id="game-invite-from">Участник приглашает сыграть</span>
-                </div>
-                <div class="game-invite-actions">
-                    <button id="game-invite-accept" class="btn btn-primary">Играть</button>
-                    <button id="game-invite-decline" class="btn btn-secondary">Позже</button>
-                </div>
-            </div>
-
             <!-- Reactions overlay for flying emojis -->
             <div id="reactions-overlay" class="reactions-overlay"></div>
 
@@ -237,12 +189,7 @@
                 </button>
 
                 <button id="reactions-btn" class="control-btn" title="Реакции" aria-label="Реакции">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <circle cx="12" cy="12" r="10"></circle>
-                        <path d="M8 14s1.5 2 4 2 4-2 4-2"></path>
-                        <line x1="9" y1="9" x2="9.01" y2="9"></line>
-                        <line x1="15" y1="9" x2="15.01" y2="9"></line>
-                    </svg>
+                    <span class="control-emoji" aria-hidden="true">🥳</span>
                 </button>
 
                 <!-- Reactions dropdown -->
