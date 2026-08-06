@@ -725,6 +725,26 @@ test('the invite is refused when it cannot reach the peer', async () => {
   assert.match(env.document.getElementById('toast').textContent, /соединени/i);
 });
 
+test('the guest stops showing the countdown once the ball is live', async () => {
+  // The guest never runs the simulation, so a state message is the only thing
+  // that can clear the "get ready" overlay for it.
+  const env = createBrowser();
+  const { app, them } = await twoPlayerCall(env, { me: 'zzzz', them: 'aaaa' });
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+  assert.strictEqual(app.game.isHost, false, 'aaaa < zzzz, so they simulate');
+
+  const message = env.document.getElementById('game-message');
+  assert.ok(!message.classList.contains('hidden'), 'the countdown is up');
+
+  await gameMsg(app, them, { op: 'state', bx: 150, by: 200, vx: 0, vy: 0, hx: 150, gx: 150 });
+  assert.ok(!message.classList.contains('hidden'), 'a frozen ball is still the countdown');
+
+  await gameMsg(app, them, { op: 'state', bx: 150, by: 200, vx: 40, vy: 120, hx: 150, gx: 150 });
+  assert.ok(message.classList.contains('hidden'), 'the ball moved, so the overlay clears');
+  app.endGame();
+});
+
 test('the host awards the point and tells the guest', async () => {
   const env = createBrowser();
   const { app, outbox, them } = await twoPlayerCall(env, { me: 'aaaa', them: 'zzzz' });

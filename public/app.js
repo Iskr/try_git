@@ -444,6 +444,9 @@ class PongGame {
             const hx = pongClamp(msg.hx, 0, PONG.W);
             const gx = pongClamp(msg.gx, 0, PONG.W);
             if ([bx, by, vx, vy, hx, gx].some((v) => v === null)) return;
+            // The guest never runs _step, so this is the only place it can
+            // learn the serve countdown is over.
+            if (vx !== 0 || vy !== 0) this.onMessage(null);
             this.remote = { bx, by, vx, vy, hx, gx };
             this.remoteAt = (typeof performance !== 'undefined' ? performance.now() : Date.now());
             this.hostX = hx;
@@ -505,6 +508,13 @@ class PongGame {
         if (this._sinceDraw >= this._frameBudget) {
             this._sinceDraw = 0;
             this.draw();
+        }
+
+        // Nothing moves after the final point: draw the result once and let the
+        // loop go, rather than spinning until the user presses exit.
+        if (this.over) {
+            this.draw();
+            this.stop();
         }
     }
 
@@ -2022,7 +2032,6 @@ class CallingApp {
             send: (payload) => this._sendGame(payload),
             onScore: (mine, theirs) => this._setGameScore(mine, theirs),
             onMessage: (text) => this._setGameMessage(text),
-            onOver: () => { this._gameOverAt = Date.now(); },
         });
 
         window.addEventListener('keydown', this._onGameKeyDown);
