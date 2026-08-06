@@ -840,23 +840,6 @@ h1 {
     }
 }
 
-/* Environment warning on the home screen */
-.env-notice {
-    margin-top: 24px;
-    max-width: 400px;
-    padding: 14px 18px;
-    border-radius: var(--radius-md);
-    background: rgba(237, 137, 54, 0.12);
-    border: 1px solid var(--warning-color);
-    color: var(--text-color);
-    font-size: 14px;
-    line-height: 1.5;
-    text-align: left;
-}
-
-.env-notice.hidden {
-    display: none;
-}
 
 /* Toast notifications */
 .toast {

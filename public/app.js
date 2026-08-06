@@ -23,6 +23,10 @@ const REJOIN_RETRY_DELAY_MS = 15000;
 const MAX_REJOIN_RETRIES = 5;
 const CONFIG_FETCH_TIMEOUT_MS = 5000;
 
+// Faces the reactions button can wear. Deliberately wider than the reaction
+// set itself — this is decoration, not a menu of what you can send.
+const BUTTON_FACES = ['🥳', '😄', '😎', '🤩', '😜', '🤗', '🙃', '😺', '🦄', '✨', '🎈', '🍿'];
+
 const AUDIO_CONSTRAINTS = {
     echoCancellation: true,
     noiseSuppression: true,
@@ -54,14 +58,14 @@ const WEBKIT_AUDIO_LIMITED = (() => {
     return IS_IOS || isSafari;
 })();
 
-// Telegram's in-app browser. On iOS it is a WKWebView that does not grant
-// camera or microphone access, so getUserMedia fails there no matter what the
-// user does — the only way through is to open the link in Safari.
+// Telegram's in-app browser. Calls generally do work in it, so this is used
+// only to give better advice when the camera is refused: there is no browser
+// permission screen to send the user to, only "open in Safari".
 const IN_TELEGRAM_WEBVIEW = typeof window.TelegramWebviewProxy !== 'undefined' ||
     !!(window.Telegram && window.Telegram.WebApp) ||
     /Telegram/i.test(navigator.userAgent || '');
-const TELEGRAM_IOS_HINT = 'Telegram на iOS не даёт браузеру доступ к камере. ' +
-    'Откройте ссылку в Safari: «···» внизу справа → «Открыть в Safari».';
+const TELEGRAM_IOS_HINT = 'Камера недоступна в Telegram. Откройте ссылку в Safari: ' +
+    '«···» внизу справа → «Открыть в Safari».';
 
 // Encrypted frame layout: [0xE2 0xEE 0x01][IV (12 bytes)][AES-GCM ciphertext]
 const E2EE_MAGIC = new Uint8Array([0xe2, 0xee, 0x01]);
@@ -463,14 +467,7 @@ class CallingApp {
             if (!document.hidden) this._resumeAfterInterruption();
         });
 
-        // Say it up front rather than after the camera has already failed
-        if (IN_TELEGRAM_WEBVIEW && IS_IOS) {
-            const notice = document.getElementById('env-notice');
-            if (notice) {
-                notice.textContent = TELEGRAM_IOS_HINT;
-                notice.classList.remove('hidden');
-            }
-        }
+        this.shuffleReactionsButton();
 
         // Check URL for room ID
         const urlParams = new URLSearchParams(window.location.search);
@@ -2076,6 +2073,15 @@ class CallingApp {
         });
     }
 
+    // The button wears a different face every time, so the control looks alive
+    // rather than like a fixed icon.
+    shuffleReactionsButton() {
+        const face = document.getElementById('reactions-btn-emoji');
+        if (!face) return;
+        const choices = BUTTON_FACES.filter(e => e !== face.textContent);
+        face.textContent = choices[Math.floor(Math.random() * choices.length)];
+    }
+
     toggleReactionsDropdown() {
         const dropdown = document.getElementById('reactions-dropdown');
         const isHidden = dropdown.classList.contains('hidden');
@@ -2083,6 +2089,7 @@ class CallingApp {
         if (isHidden) {
             // Show dropdown
             this.renderReactions();
+            this.shuffleReactionsButton();
             dropdown.classList.remove('hidden');
         } else {
             // Hide dropdown

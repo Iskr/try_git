@@ -401,29 +401,41 @@ test('an unrelated mid-call error does not end the call', async () => {
   assert.strictEqual(app.roomId, 'ROOM01', 'only a failed rejoin is fatal');
 });
 
-test("Telegram's iOS webview is called out before the camera fails", async () => {
-  // There is no permission to grant inside it, so "check your browser
-  // settings" sends the user hunting for a setting that does not exist.
+test('a refused camera inside Telegram points at Safari, not at browser settings', async () => {
+  // Calls do work in Telegram's webview, so nothing is said up front — but if
+  // the camera is refused there, there is no permission screen to send the
+  // user to, only "open in Safari".
   const env = createBrowser({ webkit: true, telegram: true });
   const app = new env.CallingApp();
-
-  const notice = env.document.getElementById('env-notice');
-  assert.strictEqual(notice.classList.contains('hidden'), false, 'the warning is shown up front');
-  assert.match(notice.textContent, /Safari/);
 
   const denied = new Error('denied');
   denied.name = 'NotAllowedError';
   assert.match(app.mediaErrorMessage(denied), /Safari/);
 });
 
-test('an ordinary browser gets no Telegram warning and the usual advice', async () => {
+test('an ordinary browser gets the usual advice', async () => {
   const env = createBrowser();
   const app = new env.CallingApp();
 
-  assert.strictEqual(env.document.getElementById('env-notice').classList.contains('hidden'), true);
   const denied = new Error('denied');
   denied.name = 'NotAllowedError';
   assert.match(app.mediaErrorMessage(denied), /настройках браузера/);
+});
+
+test('the reactions button shows a different face each time it is opened', async () => {
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  const face = env.document.getElementById('reactions-btn-emoji');
+
+  const seen = new Set();
+  for (let i = 0; i < 30; i++) {
+    const before = face.textContent;
+    app.toggleReactionsDropdown();
+    app.toggleReactionsDropdown();
+    assert.notStrictEqual(face.textContent, before, 'never repeats the face it just had');
+    seen.add(face.textContent);
+  }
+  assert.ok(seen.size > 3, `expected variety, saw ${seen.size} distinct faces`);
 });
 
 test('remote tiles start muted so iOS will autoplay them at all', async () => {

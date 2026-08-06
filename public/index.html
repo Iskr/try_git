@@ -45,9 +45,6 @@
                        spellcheck="false" aria-label="Код звонка" />
                 <button id="join-submit-btn" class="btn btn-primary">Войти</button>
             </div>
-
-            <!-- Shown only where the browser cannot get a camera at all -->
-            <div id="env-notice" class="env-notice hidden" role="alert"></div>
         </div>
 
         <!-- Call Screen -->
@@ -189,7 +186,7 @@
                 </button>
 
                 <button id="reactions-btn" class="control-btn" title="Реакции" aria-label="Реакции">
-                    <span class="control-emoji" aria-hidden="true">🥳</span>
+                    <span class="control-emoji" id="reactions-btn-emoji" aria-hidden="true">🥳</span>
                 </button>
 
                 <!-- Reactions dropdown -->
