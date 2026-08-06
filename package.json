@@ -1,6 +1,6 @@
 {
   "name": "calling-service-webapp",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "WebRTC-based calling service for Telegram and native wrappers",
   "main": "server.js",
   "scripts": {
