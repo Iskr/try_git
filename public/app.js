@@ -229,6 +229,364 @@ class FrameCryptor {
     }
 }
 
+// --- Ping-pong -------------------------------------------------------------
+// A fixed logical field in every orientation and on every device: both peers
+// simulate identical geometry, so screen size can never cause a desync. The
+// host owns the simulation; the guest sends its paddle and renders what it is
+// told, predicting only its own paddle so its input feels instant.
+const PONG = {
+    W: 300,
+    H: 400,
+    PADDLE_W: 62,
+    PADDLE_H: 10,
+    PADDLE_INSET: 22,
+    BALL_R: 6,
+    SPEED_START: 165,
+    SPEED_MAX: 300,
+    SPEED_GAIN: 1.045,
+    KEY_SPEED: 320,
+    STEP: 1 / 60,
+    SEND_HZ: 20,
+    SERVE_FREEZE_MS: 1100,
+    WIN_SCORE: 5,
+};
+
+function pongClamp(value, min, max) {
+    // Number.isFinite first: `typeof Infinity === 'number'`, and one NaN
+    // reaching the integrator freezes the board for the rest of the game.
+    if (!Number.isFinite(value)) return null;
+    return Math.min(max, Math.max(min, value));
+}
+
+class PongGame {
+    constructor(options) {
+        this.canvas = options.canvas;
+        this.isHost = options.isHost;
+        this.send = options.send;
+        this.onScore = options.onScore || (() => {});
+        this.onOver = options.onOver || (() => {});
+        this.onMessage = options.onMessage || (() => {});
+
+        this.myScore = 0;
+        this.theirScore = 0;
+        this.over = false;
+
+        // Canonical state: host paddle at the bottom, guest at the top.
+        this.hostX = PONG.W / 2;
+        this.guestX = PONG.W / 2;
+        this.ball = { x: PONG.W / 2, y: PONG.H / 2, vx: 0, vy: 0 };
+        this.freezeMs = PONG.SERVE_FREEZE_MS;
+
+        // Guest-side view of the authoritative state
+        this.remote = null;
+        this.remoteAt = 0;
+
+        this._keys = new Set();
+        this._raf = null;
+        this._lastFrame = 0;
+        this._accumulator = 0;
+        this._sendAccumulator = 0;
+        this._lastSentX = null;
+        this._paused = false;
+        // A phone renders at 30fps: this loop runs next to video decode and,
+        // with E2EE on, per-frame AES-GCM.
+        this._frameBudget = (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches) ? 1 / 30 : 0;
+        this._sinceDraw = 0;
+    }
+
+    get myPaddleX() {
+        return this.isHost ? this.hostX : this.guestX;
+    }
+
+    set myPaddleX(x) {
+        const clamped = Math.min(PONG.W - PONG.PADDLE_W / 2, Math.max(PONG.PADDLE_W / 2, x));
+        if (this.isHost) this.hostX = clamped;
+        else this.guestX = clamped;
+    }
+
+    start() {
+        if (this._raf !== null) return;
+        this._lastFrame = 0;
+        if (this.isHost) this._serve(Math.random() < 0.5 ? 1 : -1);
+        this.onMessage('Приготовьтесь…');
+        this._loop = this._loop.bind(this);
+        this._raf = requestAnimationFrame(this._loop);
+    }
+
+    stop() {
+        if (this._raf !== null) {
+            cancelAnimationFrame(this._raf);
+            this._raf = null;
+        }
+        this._keys.clear();
+    }
+
+    setPaused(paused) {
+        this._paused = paused;
+        // Restart the clock: a frame delta spanning the pause would integrate
+        // the ball straight through a paddle.
+        this._lastFrame = 0;
+    }
+
+    // The board is drawn from the local player's point of view — your paddle is
+    // always the near one — which for the guest is the canonical field rotated
+    // by 180 degrees, exactly like sitting at the other end of a table.
+    _project(x, y) {
+        return this.isHost ? { x, y } : { x: PONG.W - x, y: PONG.H - y };
+    }
+
+    pointerToPaddleX(clientX) {
+        const rect = this.canvas.getBoundingClientRect();
+        if (!rect.width) return null;
+        const local = ((clientX - rect.left) / rect.width) * PONG.W;
+        return this.isHost ? local : PONG.W - local;
+    }
+
+    onKeyDown(code) {
+        this._keys.add(code);
+    }
+
+    onKeyUp(code) {
+        this._keys.delete(code);
+    }
+
+    // --- Simulation (host only) ---
+
+    _serve(direction) {
+        this.ball.x = PONG.W / 2;
+        this.ball.y = PONG.H / 2;
+        const angle = (Math.random() - 0.5) * 0.7;
+        this.ball.vx = Math.sin(angle) * PONG.SPEED_START;
+        this.ball.vy = Math.cos(angle) * PONG.SPEED_START * direction;
+        this.freezeMs = PONG.SERVE_FREEZE_MS;
+    }
+
+    _step(dt) {
+        if (this.freezeMs > 0) {
+            this.freezeMs -= dt * 1000;
+            if (this.freezeMs > 0) return;
+            this.onMessage(null);
+        }
+
+        const ball = this.ball;
+        ball.x += ball.vx * dt;
+        ball.y += ball.vy * dt;
+
+        if (ball.x < PONG.BALL_R) {
+            ball.x = PONG.BALL_R;
+            ball.vx = Math.abs(ball.vx);
+        } else if (ball.x > PONG.W - PONG.BALL_R) {
+            ball.x = PONG.W - PONG.BALL_R;
+            ball.vx = -Math.abs(ball.vx);
+        }
+
+        const guestPlane = PONG.PADDLE_INSET + PONG.PADDLE_H / 2 + PONG.BALL_R;
+        const hostPlane = PONG.H - PONG.PADDLE_INSET - PONG.PADDLE_H / 2 - PONG.BALL_R;
+
+        if (ball.vy < 0 && ball.y <= guestPlane) {
+            if (Math.abs(ball.x - this.guestX) <= PONG.PADDLE_W / 2 + PONG.BALL_R) {
+                this._bounce(guestPlane, this.guestX, 1);
+            } else if (ball.y < -PONG.BALL_R * 2) {
+                this._goal(true);
+            }
+        } else if (ball.vy > 0 && ball.y >= hostPlane) {
+            if (Math.abs(ball.x - this.hostX) <= PONG.PADDLE_W / 2 + PONG.BALL_R) {
+                this._bounce(hostPlane, this.hostX, -1);
+            } else if (ball.y > PONG.H + PONG.BALL_R * 2) {
+                this._goal(false);
+            }
+        }
+    }
+
+    _bounce(plane, paddleX, direction) {
+        const ball = this.ball;
+        ball.y = plane;
+        const offset = (ball.x - paddleX) / (PONG.PADDLE_W / 2);
+        const speed = Math.min(PONG.SPEED_MAX, Math.hypot(ball.vx, ball.vy) * PONG.SPEED_GAIN);
+        // Steer with the paddle: hitting off-centre angles the return.
+        const angle = offset * 0.9;
+        ball.vx = Math.sin(angle) * speed;
+        ball.vy = Math.cos(angle) * speed * direction;
+    }
+
+    // Only ever runs on the host: goals are detected in _step, which the guest
+    // never executes. So "host scored" and "I scored" are the same thing here,
+    // and the scores on the wire are always (host, guest).
+    _goal(hostScored) {
+        if (hostScored) this.myScore += 1;
+        else this.theirScore += 1;
+        this.over = this.myScore >= PONG.WIN_SCORE || this.theirScore >= PONG.WIN_SCORE;
+        this.onScore(this.myScore, this.theirScore);
+        this.send({ op: 'score', h: this.myScore, g: this.theirScore });
+        if (this.over) {
+            this.onMessage(hostScored ? 'Вы выиграли!' : 'Вы проиграли');
+            this.onOver(hostScored);
+            return;
+        }
+        this._serve(hostScored ? -1 : 1);
+    }
+
+    // --- Messages from the opponent (already validated by the caller) ---
+
+    receive(msg) {
+        if (msg.op === 'input') {
+            const x = pongClamp(msg.x, 0, PONG.W);
+            if (x === null) return;
+            if (this.isHost) this.guestX = x;
+            return;
+        }
+        if (msg.op === 'state') {
+            if (this.isHost) return; // the host is the authority; ignore
+            const bx = pongClamp(msg.bx, -PONG.W, PONG.W * 2);
+            const by = pongClamp(msg.by, -PONG.H, PONG.H * 2);
+            const vx = pongClamp(msg.vx, -PONG.SPEED_MAX * 2, PONG.SPEED_MAX * 2);
+            const vy = pongClamp(msg.vy, -PONG.SPEED_MAX * 2, PONG.SPEED_MAX * 2);
+            const hx = pongClamp(msg.hx, 0, PONG.W);
+            const gx = pongClamp(msg.gx, 0, PONG.W);
+            if ([bx, by, vx, vy, hx, gx].some((v) => v === null)) return;
+            this.remote = { bx, by, vx, vy, hx, gx };
+            this.remoteAt = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+            this.hostX = hx;
+            // Snap only when the host's view of us has drifted badly — normally
+            // our own prediction is what we render.
+            if (Math.abs(gx - this.guestX) > 30) this.guestX = gx;
+            return;
+        }
+        if (msg.op === 'score') {
+            const h = pongClamp(msg.h, 0, 99);
+            const g = pongClamp(msg.g, 0, 99);
+            if (h === null || g === null) return;
+            this.myScore = this.isHost ? h : g;
+            this.theirScore = this.isHost ? g : h;
+            this.over = this.myScore >= PONG.WIN_SCORE || this.theirScore >= PONG.WIN_SCORE;
+            this.onScore(this.myScore, this.theirScore);
+            if (this.over) {
+                const iWon = this.myScore > this.theirScore;
+                this.onMessage(iWon ? 'Вы выиграли!' : 'Вы проиграли');
+                this.onOver(iWon);
+            }
+        }
+    }
+
+    // --- Loop ---
+
+    _loop(now) {
+        this._raf = requestAnimationFrame(this._loop);
+        if (this._paused) {
+            this._lastFrame = now;
+            return;
+        }
+        if (!this._lastFrame) this._lastFrame = now;
+        // Clamped: requestAnimationFrame stops in a background tab, and a
+        // multi-second delta would teleport the ball through a paddle.
+        let dt = Math.min((now - this._lastFrame) / 1000, 0.25);
+        this._lastFrame = now;
+        if (dt < 0) dt = 0;
+
+        this._applyKeys(dt);
+
+        if (this.isHost && !this.over) {
+            this._accumulator += dt;
+            let steps = 0;
+            while (this._accumulator >= PONG.STEP && steps < 20) {
+                this._step(PONG.STEP);
+                this._accumulator -= PONG.STEP;
+                steps += 1;
+            }
+        }
+
+        this._sendAccumulator += dt;
+        if (this._sendAccumulator >= 1 / PONG.SEND_HZ) {
+            this._sendAccumulator = 0;
+            this._sendTick();
+        }
+
+        this._sinceDraw += dt;
+        if (this._sinceDraw >= this._frameBudget) {
+            this._sinceDraw = 0;
+            this.draw();
+        }
+    }
+
+    _applyKeys(dt) {
+        let dir = 0;
+        if (this._keys.has('ArrowLeft') || this._keys.has('KeyA')) dir -= 1;
+        if (this._keys.has('ArrowRight') || this._keys.has('KeyD')) dir += 1;
+        if (dir !== 0) this.myPaddleX = this.myPaddleX + dir * PONG.KEY_SPEED * dt;
+    }
+
+    _sendTick() {
+        if (this.over) return;
+        if (this.isHost) {
+            const round = (v) => Math.round(v * 10) / 10;
+            this.send({
+                op: 'state',
+                bx: round(this.ball.x),
+                by: round(this.ball.y),
+                vx: round(this.ball.vx),
+                vy: round(this.ball.vy),
+                hx: round(this.hostX),
+                gx: round(this.guestX),
+            });
+        } else {
+            const x = Math.round(this.guestX * 10) / 10;
+            // Absolute position, and only when it moved: a dropped message is
+            // fully corrected by the next one, and a still paddle sends nothing.
+            if (this._lastSentX !== null && Math.abs(x - this._lastSentX) < 0.3) return;
+            this._lastSentX = x;
+            this.send({ op: 'input', x });
+        }
+    }
+
+    // --- Rendering ---
+
+    _ballNow() {
+        if (this.isHost || !this.remote) return this.ball;
+        // Extrapolate from arrival time: there is no clock sync in this app, so
+        // a remote timestamp would apply an unknown constant offset.
+        const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+        const t = Math.min((now - this.remoteAt) / 1000, 0.5);
+        return {
+            x: this.remote.bx + this.remote.vx * t,
+            y: this.remote.by + this.remote.vy * t,
+        };
+    }
+
+    draw() {
+        const ctx = this.canvas.getContext ? this.canvas.getContext('2d') : null;
+        if (!ctx) return; // jsdom, and any browser that refuses the context
+
+        const dpr = Math.min(typeof devicePixelRatio === 'number' ? devicePixelRatio : 1, 2);
+        const w = PONG.W * dpr;
+        const h = PONG.H * dpr;
+        if (this.canvas.width !== w) this.canvas.width = w;
+        if (this.canvas.height !== h) this.canvas.height = h;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+        ctx.fillStyle = '#10131a';
+        ctx.fillRect(0, 0, PONG.W, PONG.H);
+
+        ctx.fillStyle = 'rgba(255,255,255,0.14)';
+        ctx.fillRect(0, PONG.H / 2 - 1, PONG.W, 2);
+
+        const mine = this._project(this.myPaddleX, PONG.H - PONG.PADDLE_INSET);
+        const theirCanonicalX = this.isHost ? this.guestX : this.hostX;
+        const theirs = this._project(theirCanonicalX, PONG.PADDLE_INSET);
+
+        ctx.fillStyle = '#667eea';
+        ctx.fillRect(mine.x - PONG.PADDLE_W / 2, mine.y - PONG.PADDLE_H / 2, PONG.PADDLE_W, PONG.PADDLE_H);
+        ctx.fillStyle = '#f56565';
+        ctx.fillRect(theirs.x - PONG.PADDLE_W / 2, theirs.y - PONG.PADDLE_H / 2, PONG.PADDLE_W, PONG.PADDLE_H);
+
+        const ball = this._ballNow();
+        const b = this._project(ball.x, ball.y);
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, PONG.BALL_R, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
 class CallingApp {
     constructor() {
         this.ws = null;
@@ -285,6 +643,13 @@ class CallingApp {
         // an unreachable peer would be retried forever.
         this._peerReconnectAttempts = new Map();
         this._maxPeerReconnects = 3;
+
+        // Ping-pong. `game` is the only long-lived object here, and it owns
+        // exactly one timer (its rAF handle), so there is one thing to stop.
+        this.game = null;
+        this.gameOpponentId = null;
+        this.invitedPeer = null;
+        this.pendingInviteFrom = null;
 
         // Reactions system
         this.reactions = ['❤️', '👍', '😂', '😮', '😢', '🔥', '🎉', '👏', '💯', '🚀'];
@@ -386,6 +751,13 @@ class CallingApp {
                 reactionsDropdown.classList.add('hidden');
             }
 
+            // Close the opponent picker when clicking outside
+            const gameMenu = document.getElementById('game-menu');
+            const gameBtn = document.getElementById('game-btn');
+            if (!gameMenu.contains(e.target) && !gameBtn.contains(e.target)) {
+                gameMenu.classList.add('hidden');
+            }
+
             // Close volume control when clicking outside
             const volumeControl = document.getElementById('volume-control');
             const volumeBtns = document.querySelectorAll('.volume-btn');
@@ -426,6 +798,8 @@ class CallingApp {
         // Video container
         this.videosContainer = document.getElementById('videos-container');
 
+        this.initGameUI();
+
         // Best-effort leave so peers are notified even on tab close. A page
         // going into the back/forward cache is coming back, so it must keep
         // its seat.
@@ -447,6 +821,9 @@ class CallingApp {
         // the AudioContext that iOS suspends during audio interruptions.
         window.addEventListener('online', () => this._resumeAfterInterruption());
         document.addEventListener('visibilitychange', () => {
+            // requestAnimationFrame stops in a hidden tab; pausing explicitly
+            // keeps the simulation from trying to catch up on return.
+            if (this.game) this.game.setPaused(document.hidden);
             if (!document.hidden) this._resumeAfterInterruption();
         });
 
@@ -1184,6 +1561,11 @@ class CallingApp {
     }
 
     getEffectiveLayout(participantCount) {
+        // While a game is on, the video strip is ~90px tall: spotlight would
+        // put a 140px thumbnail row inside it and sidebar's 1fr 180px columns
+        // are nonsense at that height. Only the effective mode is overridden,
+        // so the user's stored choice comes back on exit.
+        if (this.game) return 'grid';
         // Alone in the room, every layout that reserves space for remote
         // tiles just shows an empty container.
         if (participantCount <= 1) return 'grid';
@@ -1375,6 +1757,9 @@ class CallingApp {
             if (this.controlChannels.get(remoteClientId) === channel) {
                 this.controlChannels.delete(remoteClientId);
             }
+            if (this.gameOpponentId === remoteClientId) {
+                this.endGame('Игра прервана: связь с участником потеряна');
+            }
         };
 
         channel.onmessage = (event) => {
@@ -1429,7 +1814,277 @@ class CallingApp {
             case 'mute-state':
                 this.handleRemoteMuteState(senderId, message);
                 break;
+            case 'game':
+                this.handleGameMessage(senderId, message);
+                break;
         }
+    }
+
+    // Every game message lands here, so this is the one place untrusted game
+    // input has to be checked — the same shape as the emoji allowlist in
+    // handleRemoteReaction and the byte-range check in handleRemoteEncryptionKey.
+    handleGameMessage(senderId, message) {
+        if (typeof message.op !== 'string') return;
+
+        if (message.op === 'invite') {
+            if (this.game || this.pendingInviteFrom || this.invitedPeer) return;
+            if (!this.participants.has(senderId)) return;
+            if (message.v !== 1) {
+                this.sendControl(senderId, { kind: 'game', op: 'decline', reason: 'version' });
+                return;
+            }
+            this._showGameInvite(senderId);
+            return;
+        }
+
+        if (message.op === 'accept') {
+            if (this.invitedPeer !== senderId) return;
+            this.invitedPeer = null;
+            this._startGame(senderId);
+            return;
+        }
+
+        if (message.op === 'decline') {
+            if (this.invitedPeer !== senderId) return;
+            this.invitedPeer = null;
+            document.getElementById('game-btn').classList.remove('pending');
+            this.showToast(message.reason === 'version'
+                ? 'У участника другая версия приложения'
+                : 'Участник отказался от игры');
+            return;
+        }
+
+        if (message.op === 'end') {
+            if (this.gameOpponentId !== senderId) return;
+            this.endGame('Игра завершена');
+            return;
+        }
+
+        // Everything below is gameplay: only the opponent may drive it. In a
+        // five-person room a third party must not be able to move the ball.
+        if (!this.game || this.gameOpponentId !== senderId) return;
+        this.game.receive(message);
+    }
+
+    // --- Ping-pong ---
+
+    initGameUI() {
+        document.getElementById('game-btn').addEventListener('click', () => this.onGameButton());
+        document.getElementById('game-exit-btn').addEventListener('click', () => this.leaveGame());
+        document.getElementById('game-invite-accept').addEventListener('click', () => this.acceptGameInvite());
+        document.getElementById('game-invite-decline').addEventListener('click', () => this.declineGameInvite());
+
+        this._onGameKeyDown = (e) => {
+            if (!this.game) return;
+            // Never swallow keys aimed at a control — #volume-slider is a range
+            // input whose arrow keys are its accessible interface.
+            if (e.target && e.target.closest && e.target.closest('input, textarea, select')) return;
+            if (e.code === 'Escape') {
+                this.leaveGame();
+                return;
+            }
+            if (['ArrowLeft', 'ArrowRight', 'KeyA', 'KeyD'].includes(e.code)) {
+                // event.code, not event.key: on a ЙЦУКЕН layout the A/D keys
+                // report 'ф' and 'в'.
+                e.preventDefault();
+                this.game.onKeyDown(e.code);
+            }
+        };
+        this._onGameKeyUp = (e) => {
+            if (this.game) this.game.onKeyUp(e.code);
+        };
+
+        const board = document.getElementById('game-board');
+        const track = (e) => {
+            if (!this.game) return;
+            const x = this.game.pointerToPaddleX(e.clientX);
+            if (x !== null) this.game.myPaddleX = x;
+        };
+        // No preventDefault or stopPropagation here: the document-level handlers
+        // that dismiss popups and recover blocked autoplay must keep seeing the
+        // event. touch-action: none in the CSS is what stops scrolling.
+        board.addEventListener('pointerdown', (e) => {
+            if (!this.game) return;
+            if (board.setPointerCapture) {
+                try { board.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+            }
+            track(e);
+        });
+        board.addEventListener('pointermove', (e) => {
+            if (e.buttons === 0 && e.pointerType !== 'mouse') return;
+            track(e);
+        });
+    }
+
+    onGameButton() {
+        if (this.game) {
+            this.leaveGame();
+            return;
+        }
+        const others = Array.from(this.participants.keys())
+            .filter((id) => id !== this.clientId && !this.participants.get(id).unreachable);
+        if (others.length === 0) {
+            this.showToast('Нужен второй участник');
+            return;
+        }
+        if (others.length === 1) {
+            this.inviteToGame(others[0]);
+            return;
+        }
+        this._showGameMenu(others);
+    }
+
+    _showGameMenu(others) {
+        const menu = document.getElementById('game-menu');
+        menu.innerHTML = '';
+        others.forEach((id) => {
+            const row = document.createElement('div');
+            row.className = 'game-option';
+            row.setAttribute('role', 'menuitem');
+            row.textContent = this.participants.get(id).name;
+            row.addEventListener('click', (e) => {
+                e.stopPropagation();
+                menu.classList.add('hidden');
+                this.inviteToGame(id);
+            });
+            menu.appendChild(row);
+        });
+        menu.classList.remove('hidden');
+    }
+
+    inviteToGame(peerId) {
+        if (!this.sendControl(peerId, { kind: 'game', op: 'invite', v: 1 })) {
+            this.showToast('Нет прямого соединения с участником');
+            return;
+        }
+        this.invitedPeer = peerId;
+        document.getElementById('game-btn').classList.add('pending');
+        this.showToast('Приглашение отправлено');
+        clearTimeout(this._inviteTimer);
+        this._inviteTimer = setTimeout(() => {
+            if (this.invitedPeer !== peerId) return;
+            this.invitedPeer = null;
+            document.getElementById('game-btn').classList.remove('pending');
+            this.showToast('Приглашение истекло');
+        }, 30000);
+    }
+
+    _showGameInvite(senderId) {
+        this.pendingInviteFrom = senderId;
+        const participant = this.participants.get(senderId);
+        document.getElementById('game-invite-from').textContent =
+            `${participant ? participant.name : 'Участник'} приглашает сыграть`;
+        document.getElementById('game-invite').classList.remove('hidden');
+        clearTimeout(this._inviteExpiry);
+        this._inviteExpiry = setTimeout(() => this._hideGameInvite(), 30000);
+    }
+
+    _hideGameInvite() {
+        clearTimeout(this._inviteExpiry);
+        this.pendingInviteFrom = null;
+        document.getElementById('game-invite').classList.add('hidden');
+    }
+
+    acceptGameInvite() {
+        const peerId = this.pendingInviteFrom;
+        this._hideGameInvite();
+        if (!peerId || !this.participants.has(peerId)) return;
+        this.sendControl(peerId, { kind: 'game', op: 'accept' });
+        this._startGame(peerId);
+    }
+
+    declineGameInvite() {
+        const peerId = this.pendingInviteFrom;
+        this._hideGameInvite();
+        if (peerId) this.sendControl(peerId, { kind: 'game', op: 'decline', reason: 'declined' });
+    }
+
+    _startGame(opponentId) {
+        if (this.game) return;
+        this.gameOpponentId = opponentId;
+        document.getElementById('game-btn').classList.remove('pending');
+
+        const opponent = this.participants.get(opponentId);
+        document.getElementById('game-opponent-name').textContent = opponent ? opponent.name : 'Соперник';
+        this._setGameScore(0, 0);
+        document.getElementById('game-panel').classList.remove('hidden');
+        this.callScreen.setAttribute('data-game', 'on');
+        // Spotlight and sidebar are meaningless in an 84px strip. The stored
+        // layoutMode is untouched, so the user's choice returns on exit.
+        this.updateGridLayout();
+
+        this.game = new PongGame({
+            canvas: document.getElementById('game-canvas'),
+            // Same election as SDP offering: both sides compute it identically
+            // from data they already have, and it survives a reconnect because
+            // clientId does.
+            isHost: this._shouldOffer(opponentId),
+            send: (payload) => this._sendGame(payload),
+            onScore: (mine, theirs) => this._setGameScore(mine, theirs),
+            onMessage: (text) => this._setGameMessage(text),
+            onOver: () => { this._gameOverAt = Date.now(); },
+        });
+
+        window.addEventListener('keydown', this._onGameKeyDown);
+        window.addEventListener('keyup', this._onGameKeyUp);
+        this.game.start();
+    }
+
+    _sendGame(payload) {
+        const channel = this.controlChannels.get(this.gameOpponentId);
+        if (!channel || channel.readyState !== 'open') return false;
+        // Backpressure guard lives here and NOT in sendControl: dropping a
+        // game tick is free, dropping an E2EE key breaks the call.
+        if ((channel.bufferedAmount || 0) > 64 * 1024) return false;
+        return this.sendControl(this.gameOpponentId, { kind: 'game', ...payload });
+    }
+
+    _setGameScore(mine, theirs) {
+        document.getElementById('game-score-you').textContent = String(mine);
+        document.getElementById('game-score-them').textContent = String(theirs);
+    }
+
+    _setGameMessage(text) {
+        const el = document.getElementById('game-message');
+        el.textContent = text || '';
+        el.classList.toggle('hidden', !text);
+    }
+
+    // The user pressed exit: tell the opponent, then tear down.
+    leaveGame() {
+        if (this.gameOpponentId) {
+            this.sendControl(this.gameOpponentId, { kind: 'game', op: 'end' });
+        }
+        this.endGame();
+    }
+
+    // Idempotent, and called from every path that can end a call or a peer —
+    // endCall, handlePeerLeft, _giveUpOnPeer, _dropPeerSession and the control
+    // channel's onclose. A game whose opponent is gone would otherwise sit
+    // there frozen with the render loop still burning battery.
+    endGame(reason) {
+        clearTimeout(this._inviteTimer);
+        this.invitedPeer = null;
+        this._hideGameInvite();
+        const btn = document.getElementById('game-btn');
+        if (btn) btn.classList.remove('pending');
+
+        if (this.game) {
+            this.game.stop();
+            this.game = null;
+        }
+        this.gameOpponentId = null;
+        window.removeEventListener('keydown', this._onGameKeyDown);
+        window.removeEventListener('keyup', this._onGameKeyUp);
+
+        const panel = document.getElementById('game-panel');
+        if (panel) panel.classList.add('hidden');
+        if (this.callScreen) this.callScreen.removeAttribute('data-game');
+        const menu = document.getElementById('game-menu');
+        if (menu) menu.classList.add('hidden');
+        this._setGameMessage(null);
+        this.updateGridLayout();
+        if (reason) this.showToast(reason);
     }
 
     // Keys are ordered by (epoch, owner): a higher epoch always wins, and an
@@ -1716,6 +2371,10 @@ class CallingApp {
     }
 
     _dropPeerSession(clientId) {
+        // The subtle one: the peer is reconnecting, so its data channel is
+        // already dead. A game left running here would simply freeze, with no
+        // error anywhere to explain it.
+        if (this.gameOpponentId === clientId) this.endGame('Игра прервана: участник переподключается');
         this._clearIceRestartTimer(clientId);
         this._clearNegotiationWatchdog(clientId);
         this._iceRestartAttempts.delete(clientId);
@@ -1768,6 +2427,7 @@ class CallingApp {
     // trying harder, and the churn costs mobile clients their battery.
     _giveUpOnPeer(clientId) {
         console.warn(`Giving up on peer ${clientId} — recovery exhausted`);
+        if (this.gameOpponentId === clientId) this.endGame();
         this._clearIceRestartTimer(clientId);
         this._clearNegotiationWatchdog(clientId);
         this._iceRestartAttempts.delete(clientId);
@@ -1824,6 +2484,9 @@ class CallingApp {
     handlePeerLeft(clientId) {
         if (typeof clientId !== 'string' || !this.participants.has(clientId)) return;
         console.log('Peer left:', clientId);
+
+        if (this.gameOpponentId === clientId) this.endGame('Соперник покинул игру');
+        if (this.invitedPeer === clientId || this.pendingInviteFrom === clientId) this.endGame();
 
         // Clean up reconnection state
         this._clearIceRestartTimer(clientId);
@@ -2294,6 +2957,10 @@ class CallingApp {
     }
 
     endCall() {
+        // Before teardownPeers, so the game still has a channel to say goodbye
+        // on, and so its render loop cannot outlive the call screen.
+        this.leaveGame();
+
         // Any capture still waiting on the permission prompt is now unwanted
         this._mediaGeneration += 1;
 

@@ -240,6 +240,20 @@ function createBrowser(options = {}) {
     window.RTCRtpScriptTransform = function RTCRtpScriptTransform() {};
   }
   window.HTMLMediaElement.prototype.play = () => Promise.resolve();
+  // jsdom has no canvas backend, so getContext throws unless stubbed. Returning
+  // null is also what a browser can do, and the game must survive it.
+  window.HTMLCanvasElement.prototype.getContext = () => null;
+  let rafId = 0;
+  const rafHandles = new Map();
+  window.requestAnimationFrame = (cb) => {
+    rafId += 1;
+    rafHandles.set(rafId, setTimeout(() => cb(Date.now()), 16));
+    return rafId;
+  };
+  window.cancelAnimationFrame = (id) => {
+    clearTimeout(rafHandles.get(id));
+    rafHandles.delete(id);
+  };
   window.fetch = async () => ({
     ok: true,
     json: async () => ({

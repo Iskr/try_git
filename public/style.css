@@ -808,6 +808,260 @@ h1 {
     display: none;
 }
 
+/* Ping-pong
+   The board is a sibling of .videos-container, so none of the [data-layout] /
+   [data-participants] rules above are involved. While a game runs, #call-screen
+   itself becomes a grid; .screen.active is display:flex at (0,2,0) specificity
+   and the id selector below is (1,1,0), so it wins without !important. */
+.game-panel {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    gap: 8px;
+    padding: 8px 12px 12px;
+    background: var(--surface-color);
+    border-top: 1px solid var(--border-color);
+    overscroll-behavior: contain;
+}
+
+.game-panel.hidden {
+    display: none;
+}
+
+#call-screen[data-game="on"] {
+    display: grid;
+    grid-template-rows: auto minmax(84px, 24vh) minmax(0, 1fr) auto;
+}
+
+/* Buy back vertical space on a phone — without this the board is unplayably
+   small. The status bar stays: dropping the connection indicator to make room
+   for a game is the wrong trade. */
+#call-screen[data-game="on"] .call-info {
+    padding: 8px 12px;
+}
+
+#call-screen[data-game="on"] .room-id-display {
+    margin-bottom: 2px;
+}
+
+#call-screen[data-game="on"] .controls {
+    padding: 10px;
+    gap: 12px;
+}
+
+@media (min-width: 900px), (orientation: landscape) and (min-width: 640px) and (max-height: 560px) {
+    #call-screen[data-game="on"] {
+        grid-template-rows: auto minmax(0, 1fr) auto;
+        grid-template-columns: minmax(0, 1fr) minmax(300px, 38%);
+    }
+
+    #call-screen[data-game="on"] .call-info,
+    #call-screen[data-game="on"] .controls {
+        grid-column: 1 / -1;
+    }
+
+    .game-panel {
+        border-top: none;
+        border-left: 1px solid var(--border-color);
+    }
+}
+
+.game-scoreboard {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 10px;
+    font-variant-numeric: tabular-nums;
+}
+
+.game-score-side {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.game-score-name {
+    font-size: 13px;
+    color: var(--text-secondary);
+    max-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.game-score-value {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--primary-color);
+}
+
+.game-score-sep {
+    font-size: 18px;
+    color: var(--text-secondary);
+}
+
+.game-board {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* Not optional: without it the browser claims the horizontal drag for
+       scrolling or the iOS back-swipe and eats the start of every stroke. */
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.game-canvas {
+    aspect-ratio: 3 / 4;
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: var(--radius-md);
+    background: #10131a;
+    cursor: none;
+    display: block;
+}
+
+.game-message {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    background: rgba(0, 0, 0, 0.75);
+    color: white;
+    padding: 10px 18px;
+    border-radius: var(--radius-md);
+    font-size: 15px;
+    font-weight: 600;
+    text-align: center;
+    pointer-events: none;
+}
+
+.game-message.hidden {
+    display: none;
+}
+
+.game-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.game-hint {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.game-bar-btn {
+    border: 1px solid var(--border-color);
+    background: var(--bg-color);
+    color: var(--text-color);
+    border-radius: var(--radius-sm);
+    padding: 6px 14px;
+    font-size: 14px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.game-bar-btn:hover {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+}
+
+/* Above the reactions dropdown (1000) and the volume popup (1001): an incoming
+   invitation outranks both. */
+.game-invite {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: calc(96px + env(safe-area-inset-bottom, 0px));
+    z-index: 1002;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    background: var(--surface-color);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-xl);
+    padding: 12px 16px;
+}
+
+.game-invite.hidden {
+    display: none;
+}
+
+.game-invite-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 14px;
+}
+
+.game-invite-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.game-invite-actions .btn {
+    padding: 8px 18px;
+    font-size: 14px;
+    border-radius: var(--radius-sm);
+}
+
+@media (min-width: 768px) {
+    .game-invite {
+        left: auto;
+        right: 24px;
+        max-width: 440px;
+    }
+}
+
+/* Opponent picker, positioned like the layout selector */
+.game-menu {
+    position: absolute;
+    top: 60px;
+    right: 20px;
+    background: var(--surface-color);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-xl);
+    border: 1px solid var(--border-color);
+    padding: 8px;
+    z-index: 200;
+    min-width: 200px;
+}
+
+.game-menu.hidden {
+    display: none;
+}
+
+.game-option {
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    font-size: 15px;
+    color: var(--text-color);
+}
+
+.game-option:hover {
+    background: var(--bg-color);
+}
+
+.icon-btn.pending {
+    color: var(--primary-color);
+    animation: gamePending 1.4s ease-in-out infinite;
+}
+
+@keyframes gamePending {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+
 /* Toast notifications */
 .toast {
     position: fixed;
