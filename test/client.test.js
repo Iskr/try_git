@@ -1024,17 +1024,154 @@ test('a stale key is refused and the newer one re-asserted', async () => {
   assert.strictEqual(outbox[0].epoch, 2);
 });
 
-test('two peers enabling at once converge on the same key', async () => {
-  // Same epoch, different owners: the lower owner id wins, and both sides
-  // compute that identically.
+test('encryption is on before anyone touches the button', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+  assert.strictEqual(
+    env.document.getElementById('encryption-indicator').classList.contains('hidden'),
+    false,
+    'and the lock is shown'
+  );
+});
+
+test('one member cannot switch the room to plaintext on its own', async () => {
+  // Without the vote check this is all it took: send e2ee-off and everyone
+  // drops to plaintext while still looking at a lock indicator a moment ago.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  attachControlChannel(app, 'zzzz');
+
+  await app.handleControlMessage('zzzz', JSON.stringify({ kind: 'e2ee-off' }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'still encrypted');
+
+  // Nor does inventing a vote id we never agreed to
+  await app.handleControlMessage('zzzz', JSON.stringify({ kind: 'e2ee-off', voteId: 'made-up' }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+});
+
+test('a refusal keeps encryption on', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  const outbox = attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = outbox.find((m) => m.kind === 'e2ee-off-request');
+  assert.ok(request, 'the room is asked');
+
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-vote', voteId: request.voteId, agree: false,
+  }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+  assert.strictEqual(outbox.filter((m) => m.kind === 'e2ee-off').length, 0, 'nothing announced');
+  assert.match(env.document.getElementById('toast').textContent, /против/i);
+});
+
+test('unanimous agreement switches it off', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  ['mmmm', 'zzzz'].forEach((id) => app.participants.set(id, { id, name: id }));
+  const first = attachControlChannel(app, 'mmmm');
+  attachControlChannel(app, 'zzzz');
+
+  app.proposeDisableEncryption();
+  const request = first.find((m) => m.kind === 'e2ee-off-request');
+
+  await app.handleControlMessage('mmmm', JSON.stringify({
+    kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+  }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'one voice is not enough');
+
+  await app.handleControlMessage('zzzz', JSON.stringify({
+    kind: 'e2ee-off-vote', voteId: request.voteId, agree: true,
+  }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+  assert.ok(first.some((m) => m.kind === 'e2ee-off' && m.voteId === request.voteId));
+});
+
+test('we only switch off for a vote we agreed to ourselves', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  const outbox = attachControlChannel(app, 'aaaa');
+
+  await app.handleControlMessage('aaaa', JSON.stringify({
+    kind: 'e2ee-off-request', voteId: 'v1',
+  }));
+  assert.strictEqual(
+    env.document.getElementById('e2ee-vote').classList.contains('hidden'),
+    false,
+    'we are asked'
+  );
+
+  app.answerDisableRequest(false);
+  const reply = outbox.find((m) => m.kind === 'e2ee-off-vote');
+  assert.strictEqual(reply.agree, false);
+
+  // The proposer announcing the result anyway must not move us
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off', voteId: 'v1' }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+});
+
+test('agreeing then receiving the result switches us off', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  attachControlChannel(app, 'aaaa');
+
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off-request', voteId: 'v2' }));
+  app.answerDisableRequest(true);
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off', voteId: 'v2' }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+
+  // ...and the same announcement replayed later does nothing
+  await app.enableEncryption({ silent: true });
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off', voteId: 'v2' }));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'a replayed result is spent');
+});
+
+test('a peer that cannot encrypt puts it to the room rather than vanishing', async () => {
+  // With encryption on by default such a peer is simply invisible to everyone
+  // and has no idea why, so the room is asked whether to switch off for them.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Гость' });
+  const outbox = attachControlChannel(app, 'zzzz');
+
+  await app.handleControlMessage('zzzz', JSON.stringify({ kind: 'e2ee-unsupported' }));
+
+  const request = outbox.find((m) => m.kind === 'e2ee-off-request');
+  assert.ok(request, 'a vote is opened');
+  assert.match(request.reason, /Гость/);
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'nothing changes until they agree');
+});
+
+test('everyone enabling at once converges on one key', async () => {
+  // Encryption is on from the moment of joining, so every peer arrives with a
+  // key of its own at epoch 1. Same epoch, different owners: the lower owner
+  // id wins, and every side computes that identically.
   const env = createBrowser({ frameEncryption: true });
   const { app } = await joinedApp(env, { clientId: 'mmmm' });
   const outbox = attachControlChannel(app, 'zzzz');
 
-  await app.handleRemoteEncryptionKey('zzzz', keyOf(9), 'zzzz', 1);
-  assert.ok(app.frameCryptor.hasSameKey(new Uint8Array(keyOf(9))));
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'on by default');
+  assert.strictEqual(app.keyOwner, 'mmmm');
+  assert.strictEqual(app.keyEpoch, 1);
 
-  // A key from a lower-id owner at the same epoch outranks it
+  // A higher owner id at the same epoch loses: we keep ours and re-assert it
+  outbox.length = 0;
+  await app.handleRemoteEncryptionKey('zzzz', keyOf(9), 'zzzz', 1);
+  assert.ok(!app.frameCryptor.hasSameKey(new Uint8Array(keyOf(9))));
+  assert.strictEqual(app.keyOwner, 'mmmm');
+  assert.strictEqual(outbox[0].owner, 'mmmm');
+
+  // A lower owner id at the same epoch outranks us
   await app.handleRemoteEncryptionKey('aaaa', keyOf(3), 'aaaa', 1);
   assert.ok(app.frameCryptor.hasSameKey(new Uint8Array(keyOf(3))));
   assert.strictEqual(app.keyOwner, 'aaaa');

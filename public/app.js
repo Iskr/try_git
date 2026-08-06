@@ -22,6 +22,9 @@ const NEGOTIATION_WATCHDOG_MS = 8000;
 const REJOIN_RETRY_DELAY_MS = 15000;
 const MAX_REJOIN_RETRIES = 5;
 const CONFIG_FETCH_TIMEOUT_MS = 5000;
+// How long the room has to agree before a proposal to switch encryption off
+// lapses. Silence is a refusal, so this only ever fails closed.
+const E2EE_VOTE_TIMEOUT_MS = 20000;
 
 const AUDIO_CONSTRAINTS = {
     echoCancellation: true,
@@ -664,6 +667,12 @@ class CallingApp {
         // id). keyOwner is who announced it; keyEpoch counts rotations.
         this.keyOwner = null;
         this.keyEpoch = 0;
+        // Turning encryption off needs everyone's agreement. A peer only ever
+        // switches off for a vote it agreed to itself, so a lone member cannot
+        // drop the room to plaintext by sending 'e2ee-off' out of the blue.
+        this._agreedVotes = new Set();
+        this._pendingVote = null;
+        this._incomingVote = null;
 
         this.rtcConfig = DEFAULT_RTC_CONFIG;
         this.maxParticipants = MAX_PARTICIPANTS;
@@ -871,6 +880,8 @@ class CallingApp {
             if (!document.hidden) this._resumeAfterInterruption();
         });
 
+        document.getElementById('e2ee-vote-yes').addEventListener('click', () => this.answerDisableRequest(true));
+        document.getElementById('e2ee-vote-no').addEventListener('click', () => this.answerDisableRequest(false));
         document.getElementById('random-call-btn').addEventListener('click', () => this.toggleRandomSizes());
         document.querySelectorAll('.random-size-btn').forEach((btn) => {
             btn.addEventListener('click', () => this.startWaiting(parseInt(btn.dataset.size, 10)));
@@ -1188,6 +1199,11 @@ class CallingApp {
         this._joining = false;
         this._rejoining = false;
         if (this._waitingSize) this._stopWaiting();
+        clearTimeout(this._pendingVote && this._pendingVote.timer);
+        this._pendingVote = null;
+        this._incomingVote = null;
+        this._agreedVotes.clear();
+        this._hideVotePrompt();
         this._rejoinRetryAttempt = 0;
         clearTimeout(this._rejoinRetryTimer);
         this.roomId = message.roomId;
@@ -1205,6 +1221,12 @@ class CallingApp {
 
         const ok = await this.startCall();
         if (!ok) return;
+
+        // On by default: everyone starts with their own key and the room
+        // converges on one by the (epoch, owner) ordering. Doing it this way
+        // rather than electing an owner first means media is encrypted from
+        // the first frame instead of from whenever an election settles.
+        await this.enableEncryption({ silent: true });
 
         const others = Array.isArray(message.participants) ? message.participants : [];
         for (const participantId of others) {
@@ -1955,9 +1977,16 @@ class CallingApp {
                 await this.handleRemoteEncryptionKey(senderId, message.key, message.owner, message.epoch);
                 break;
             case 'e2ee-off':
-                this.handleRemoteEncryptionDisabled(senderId);
+                this.handleRemoteEncryptionDisabled(senderId, message);
+                break;
+            case 'e2ee-off-request':
+                this.handleDisableRequest(senderId, message);
+                break;
+            case 'e2ee-off-vote':
+                this.handleDisableVote(senderId, message);
                 break;
             case 'e2ee-unsupported': {
+                this._onPeerCannotEncrypt(senderId);
                 // Remember it: such a peer can never rotate the key, so it
                 // must not win the rekey election when somebody leaves.
                 const participant = this.participants.get(senderId);
@@ -2306,13 +2335,19 @@ class CallingApp {
         }
     }
 
-    handleRemoteEncryptionDisabled(senderId) {
+    handleRemoteEncryptionDisabled(senderId, message) {
         if (!this.frameCryptor.encryptionEnabled) return;
-        this.frameCryptor.disable();
-        this.keyOwner = null;
-        this.updateEncryptionUI(false);
-        console.log('Encryption disabled by:', senderId);
-        this.showToast('🔓 Шифрование выключено');
+        const voteId = message && message.voteId;
+        // The only thing that can switch us off is the result of a vote we
+        // agreed to. A member sending 'e2ee-off' on its own - or replaying an
+        // old one - changes nothing here.
+        if (typeof voteId !== 'string' || !this._agreedVotes.has(voteId)) {
+            console.warn('Ignoring e2ee-off without our agreement, from', senderId);
+            return;
+        }
+        this._agreedVotes.delete(voteId);
+        console.log('Encryption disabled by agreement, announced by:', senderId);
+        this._applyDisableEncryption();
     }
 
     handleRemoteMuteState(senderId, message) {
@@ -2769,38 +2804,161 @@ class CallingApp {
         indicator.classList.toggle('hidden', !enabled);
     }
 
+    // Their media would silently vanish under everyone's lock indicator.
+    // Rather than leave them invisible with no explanation, the room is asked
+    // whether to switch encryption off so they can be seen. Only the key owner
+    // asks, so five peers do not open five votes about the same person.
+    _onPeerCannotEncrypt(senderId) {
+        if (!this.frameCryptor.encryptionEnabled) return;
+        if (this.keyOwner !== this.clientId) return;
+        if (this._pendingVote) return;
+        const who = this.participants.get(senderId);
+        const name = who ? who.name : 'Участник';
+        this.proposeDisableEncryption(`${name} не может шифровать и никого не увидит.`);
+    }
+
+    async enableEncryption(options) {
+        if (!this.frameCryptor.supported || this.frameCryptor.encryptionEnabled) return false;
+        // A fresh key on every enable doubles as key rotation: turning it off
+        // and on after someone leaves locks the old key out.
+        await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
+        this.keyOwner = this.clientId;
+        this.keyEpoch += 1;
+        this.frameCryptor.enable();
+        // The key travels only over DTLS-encrypted peer-to-peer data channels
+        // - the signaling server never sees it.
+        this.broadcastControl({
+            kind: 'e2ee-key',
+            key: Array.from(this.frameCryptor.rawKeyData),
+            owner: this.keyOwner,
+            epoch: this.keyEpoch
+        });
+        this.updateEncryptionUI(true);
+        if (!(options && options.silent)) this.showToast('\u{1F512} Шифрование включено');
+        return true;
+    }
+
     async toggleEncryption() {
         if (!this.frameCryptor.supported) {
             this.showToast('Шифрование не поддерживается в этом браузере');
             return;
         }
+        if (!this.frameCryptor.encryptionEnabled) {
+            await this.enableEncryption();
+            return;
+        }
+        this.proposeDisableEncryption();
+    }
 
-        const enabling = !this.frameCryptor.encryptionEnabled;
-
-        if (enabling) {
-            // A fresh key on every enable doubles as key rotation: toggling
-            // off and on after someone leaves locks the old key out.
-            await this.frameCryptor.setKey(crypto.getRandomValues(new Uint8Array(E2EE_KEY_BYTES)));
-            this.keyOwner = this.clientId;
-            this.keyEpoch += 1;
-            this.frameCryptor.enable();
-            // The key travels only over DTLS-encrypted peer-to-peer data
-            // channels — the signaling server never sees it.
-            this.broadcastControl({
-                kind: 'e2ee-key',
-                key: Array.from(this.frameCryptor.rawKeyData),
-                owner: this.keyOwner,
-                epoch: this.keyEpoch
-            });
-            this.showToast('🔒 Шифрование включено');
-        } else {
-            this.frameCryptor.disable();
-            this.keyOwner = null;
-            this.broadcastControl({ kind: 'e2ee-off' });
-            this.showToast('🔓 Шифрование выключено');
+    // Switching encryption off is the whole room's decision, so it is put to
+    // the others and only carried out if every one of them agrees.
+    proposeDisableEncryption(reason) {
+        if (this._pendingVote) {
+            this.showToast('Голосование уже идёт');
+            return;
+        }
+        const peers = Array.from(this.controlChannels.keys());
+        if (peers.length === 0) {
+            // Alone: there is nobody to disagree with.
+            this._applyDisableEncryption();
+            return;
         }
 
-        this.updateEncryptionUI(enabling);
+        const voteId = `${this.clientId}:${Date.now()}:${Math.floor(Math.random() * 1e6)}`;
+        // We are the ones asking, so our agreement is implied - and recorded,
+        // because that is what lets us act on the result.
+        this._agreedVotes.add(voteId);
+        this._pendingVote = { voteId, peers: new Set(peers), agreed: new Set(), reason };
+
+        this.broadcastControl({ kind: 'e2ee-off-request', voteId, reason: reason || null });
+        this.showToast('Спрашиваем остальных…');
+
+        this._pendingVote.timer = setTimeout(() => {
+            // Silence is not consent.
+            this._failVote('Не все ответили — шифрование остаётся включённым');
+        }, E2EE_VOTE_TIMEOUT_MS);
+    }
+
+    _failVote(text) {
+        if (!this._pendingVote) return;
+        clearTimeout(this._pendingVote.timer);
+        this._agreedVotes.delete(this._pendingVote.voteId);
+        this._pendingVote = null;
+        this.showToast(text);
+    }
+
+    handleDisableRequest(senderId, message) {
+        if (typeof message.voteId !== 'string' || !message.voteId) return;
+        if (!this.frameCryptor.encryptionEnabled) {
+            // Nothing to turn off; agreeing costs nothing and unblocks them.
+            this.sendControl(senderId, { kind: 'e2ee-off-vote', voteId: message.voteId, agree: true });
+            return;
+        }
+        this._incomingVote = { voteId: message.voteId, from: senderId };
+        const who = this.participants.get(senderId);
+        const name = who ? who.name : 'Участник';
+        this._showVotePrompt(typeof message.reason === 'string' && message.reason
+            ? `${message.reason} Выключить шифрование?`
+            : `${name} предлагает выключить шифрование. Согласны?`);
+    }
+
+    answerDisableRequest(agree) {
+        const vote = this._incomingVote;
+        this._hideVotePrompt();
+        if (!vote) return;
+        this._incomingVote = null;
+        // Recorded before replying: this is what we check when the result comes
+        // back, so we can never be switched off by a vote we refused.
+        if (agree) this._agreedVotes.add(vote.voteId);
+        this.sendControl(vote.from, { kind: 'e2ee-off-vote', voteId: vote.voteId, agree: !!agree });
+    }
+
+    handleDisableVote(senderId, message) {
+        const vote = this._pendingVote;
+        if (!vote || message.voteId !== vote.voteId) return;
+        if (!vote.peers.has(senderId)) return;
+        if (!message.agree) {
+            this._failVote('Кто-то против — шифрование остаётся включённым');
+            return;
+        }
+        vote.agreed.add(senderId);
+        // Anyone who joined or reconnected mid-vote is not in `peers`, so the
+        // set that agreed would no longer be the set that is in the room.
+        const roomPeers = Array.from(this.controlChannels.keys());
+        if (roomPeers.some((id) => !vote.peers.has(id))) {
+            this._failVote('Состав участников изменился — голосование отменено');
+            return;
+        }
+        if (vote.agreed.size < vote.peers.size) return;
+
+        clearTimeout(vote.timer);
+        this._pendingVote = null;
+        this.broadcastControl({ kind: 'e2ee-off', voteId: vote.voteId });
+        this._applyDisableEncryption();
+    }
+
+    _applyDisableEncryption() {
+        this.frameCryptor.disable();
+        this.keyOwner = null;
+        this.updateEncryptionUI(false);
+        this.showToast('\u{1F513} Шифрование выключено');
+    }
+
+    _showVotePrompt(text) {
+        const box = document.getElementById('e2ee-vote');
+        if (!box) return;
+        document.getElementById('e2ee-vote-text').textContent = text;
+        box.classList.remove('hidden');
+        clearTimeout(this._votePromptTimer);
+        // Answering nothing is a refusal, so the prompt closes itself well
+        // inside the proposer's window.
+        this._votePromptTimer = setTimeout(() => this.answerDisableRequest(false), E2EE_VOTE_TIMEOUT_MS - 3000);
+    }
+
+    _hideVotePrompt() {
+        clearTimeout(this._votePromptTimer);
+        const box = document.getElementById('e2ee-vote');
+        if (box) box.classList.add('hidden');
     }
 
     // Reactions System

@@ -1215,6 +1215,43 @@ h1 {
     50% { opacity: 0.35; }
 }
 
+/* Consent prompt for switching encryption off */
+.e2ee-vote {
+    position: fixed;
+    left: 50%;
+    bottom: 110px;
+    transform: translateX(-50%);
+    width: min(360px, calc(100vw - 32px));
+    background: var(--surface-color);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-xl);
+    padding: 16px;
+    z-index: 1200;
+    animation: fadeIn 0.2s ease;
+}
+
+.e2ee-vote.hidden {
+    display: none;
+}
+
+.e2ee-vote-text {
+    font-size: 15px;
+    margin-bottom: 12px;
+    color: var(--text-color);
+}
+
+.e2ee-vote-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.e2ee-vote-actions .btn {
+    padding: 12px 8px;
+    font-size: 15px;
+}
+
 /* Toast notifications */
 .toast {
     position: fixed;
