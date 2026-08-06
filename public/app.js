@@ -352,6 +352,15 @@ class PongGame {
         return this.isHost ? { x, y } : { x: PONG.W - x, y: PONG.H - y };
     }
 
+    // Canonical Y of each paddle. The host defends the bottom of the canonical
+    // field and the guest the top; _project then turns whichever is ours into
+    // the near edge of our own screen.
+    _paddleEnds() {
+        const bottom = PONG.H - PONG.PADDLE_INSET;
+        const top = PONG.PADDLE_INSET;
+        return this.isHost ? { mine: bottom, theirs: top } : { mine: top, theirs: bottom };
+    }
+
     pointerToPaddleX(clientX) {
         const rect = this.canvas.getBoundingClientRect();
         if (!rect.width) return null;
@@ -596,9 +605,15 @@ class PongGame {
         ctx.fillStyle = 'rgba(255,255,255,0.14)';
         ctx.fillRect(0, PONG.H / 2 - 1, PONG.W, 2);
 
-        const mine = this._project(this.myPaddleX, PONG.H - PONG.PADDLE_INSET);
+        // These are canonical coordinates, so which end each paddle sits at
+        // depends on the role — passing the host's end for everyone made
+        // _project rotate it a second time for the guest, putting the guest's
+        // own paddle at the top of its screen while the ball it had to block
+        // arrived at the bottom.
+        const ends = this._paddleEnds();
+        const mine = this._project(this.myPaddleX, ends.mine);
         const theirCanonicalX = this.isHost ? this.guestX : this.hostX;
-        const theirs = this._project(theirCanonicalX, PONG.PADDLE_INSET);
+        const theirs = this._project(theirCanonicalX, ends.theirs);
 
         ctx.fillStyle = '#667eea';
         ctx.fillRect(mine.x - PONG.PADDLE_W / 2, mine.y - PONG.PADDLE_H / 2, PONG.PADDLE_W, PONG.PADDLE_H);

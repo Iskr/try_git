@@ -196,6 +196,55 @@ test('an impolite peer re-asserts its offer on collision so the pair cannot dead
   );
 });
 
+test('the guest sees its own paddle at its own end of the board', async () => {
+  // The paddle Ys are canonical, so passing the host's end for both players
+  // made _project rotate it a second time for the guest: its own paddle drew
+  // at the top of its screen while the ball it had to block arrived at the
+  // bottom, which reads as broken physics rather than a mirrored board.
+  const env = createBrowser();
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  const PONG = env.PONG;
+
+  // 'zzzz' > 'aaaa', so we are not the offerer and therefore the guest
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  app._startGame('aaaa');
+  const game = app.game;
+  assert.strictEqual(game.isHost, false, 'the higher client id plays as guest');
+
+  const ends = game._paddleEnds();
+  const mine = game._project(0, ends.mine);
+  const theirs = game._project(0, ends.theirs);
+
+  assert.ok(mine.y > PONG.H / 2, `own paddle must be on the near half, got y=${mine.y}`);
+  assert.ok(theirs.y < PONG.H / 2, `opponent must be on the far half, got y=${theirs.y}`);
+
+  // ...and the ball crossing the guest's canonical plane arrives at the paddle
+  const ballAtMyPlane = game._project(0, PONG.PADDLE_INSET);
+  assert.ok(
+    Math.abs(ballAtMyPlane.y - mine.y) < 1,
+    'the ball reaches the same edge the paddle defends'
+  );
+
+  app.endGame();
+});
+
+test('the host sees its own paddle at its own end of the board', async () => {
+  const env = createBrowser();
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  const PONG = env.PONG;
+
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  app._startGame('zzzz');
+  const game = app.game;
+  assert.strictEqual(game.isHost, true);
+
+  const ends = game._paddleEnds();
+  assert.ok(game._project(0, ends.mine).y > PONG.H / 2);
+  assert.ok(game._project(0, ends.theirs).y < PONG.H / 2);
+
+  app.endGame();
+});
+
 test('a refused camera inside Telegram points at Safari, not at browser settings', async () => {
   // Calls do work in Telegram's webview, so nothing is said up front — but if
   // the camera is refused there, there is no permission screen to send the

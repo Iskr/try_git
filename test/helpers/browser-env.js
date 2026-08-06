@@ -282,14 +282,16 @@ function createBrowser(options = {}) {
 
   // Class declarations inside an indirect eval stay in that eval's scope, so
   // the constructor has to be handed out explicitly.
-  window.eval(`${source.replace(bootstrap, '')}\n;window.__CallingApp = CallingApp;`);
+  window.eval(`${source.replace(bootstrap, '')}\n;window.__CallingApp = CallingApp; window.__PONG = PONG;`);
   const CallingApp = window.__CallingApp;
+  const PONG = window.__PONG;
 
   return {
     dom,
     window,
     document: window.document,
     CallingApp,
+    PONG,
     media,
     sockets,
     peerConnections,
