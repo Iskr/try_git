@@ -233,6 +233,10 @@ function createBrowser(options = {}) {
   window.AudioContext = FakeAudioContext;
   // jsdom exposes crypto as a read-only accessor and ships no subtle
   Object.defineProperty(window, 'crypto', { value: webcrypto, configurable: true });
+  if (options.telegram) {
+    // What Telegram injects into its in-app webview
+    window.TelegramWebviewProxy = { postEvent() {} };
+  }
   if (options.frameEncryption) {
     // Presence of this constructor is what FrameCryptor feature-detects. The
     // transforms are only installed on real senders/receivers, so the key
@@ -240,6 +244,20 @@ function createBrowser(options = {}) {
     window.RTCRtpScriptTransform = function RTCRtpScriptTransform() {};
   }
   window.HTMLMediaElement.prototype.play = () => Promise.resolve();
+  // jsdom has no canvas backend, so getContext throws unless stubbed. Returning
+  // null is also what a browser can do, and the game must survive it.
+  window.HTMLCanvasElement.prototype.getContext = () => null;
+  let rafId = 0;
+  const rafHandles = new Map();
+  window.requestAnimationFrame = (cb) => {
+    rafId += 1;
+    rafHandles.set(rafId, setTimeout(() => cb(Date.now()), 16));
+    return rafId;
+  };
+  window.cancelAnimationFrame = (id) => {
+    clearTimeout(rafHandles.get(id));
+    rafHandles.delete(id);
+  };
   window.fetch = async () => ({
     ok: true,
     json: async () => ({

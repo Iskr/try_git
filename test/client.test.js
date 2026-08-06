@@ -196,6 +196,43 @@ test('an impolite peer re-asserts its offer on collision so the pair cannot dead
   );
 });
 
+test('a refused camera inside Telegram points at Safari, not at browser settings', async () => {
+  // Calls do work in Telegram's webview, so nothing is said up front — but if
+  // the camera is refused there, there is no permission screen to send the
+  // user to, only "open in Safari".
+  const env = createBrowser({ webkit: true, telegram: true });
+  const app = new env.CallingApp();
+
+  const denied = new Error('denied');
+  denied.name = 'NotAllowedError';
+  assert.match(app.mediaErrorMessage(denied), /Safari/);
+});
+
+test('an ordinary browser gets the usual advice', async () => {
+  const env = createBrowser();
+  const app = new env.CallingApp();
+
+  const denied = new Error('denied');
+  denied.name = 'NotAllowedError';
+  assert.match(app.mediaErrorMessage(denied), /настройках браузера/);
+});
+
+test('the reactions button shows a different face each time it is opened', async () => {
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  const face = env.document.getElementById('reactions-btn-emoji');
+
+  const seen = new Set();
+  for (let i = 0; i < 30; i++) {
+    const before = face.textContent;
+    app.toggleReactionsDropdown();
+    app.toggleReactionsDropdown();
+    assert.notStrictEqual(face.textContent, before, 'never repeats the face it just had');
+    seen.add(face.textContent);
+  }
+  assert.ok(seen.size > 3, `expected variety, saw ${seen.size} distinct faces`);
+});
+
 test('a peer that cannot encrypt does not win the rekey election', async () => {
   const env = createBrowser({ frameEncryption: true });
   const { app } = await joinedApp(env, { clientId: 'mmmm' });
@@ -529,6 +566,241 @@ test('a page entering the back/forward cache keeps its seat', async () => {
   const unloading = new env.window.PageTransitionEvent('pagehide', { persisted: false });
   env.window.dispatchEvent(unloading);
   assert.strictEqual(socket.sent.filter((m) => m.type === 'leave').length, 1);
+});
+
+// --- Ping-pong --------------------------------------------------------------
+
+function gameMsg(app, senderId, payload) {
+  return app.handleControlMessage(senderId, JSON.stringify({ kind: 'game', ...payload }));
+}
+
+async function twoPlayerCall(env, { me = 'aaaa', them = 'zzzz' } = {}) {
+  const { app, socket } = await joinedApp(env, { clientId: me });
+  app.participants.set(them, { id: them, name: 'Участник zzzz' });
+  const outbox = attachControlChannel(app, them);
+  return { app, socket, outbox, them };
+}
+
+test('the call screen starts with no game', async () => {
+  const env = createBrowser();
+  await joinedApp(env, { clientId: 'aaaa' });
+  assert.ok(env.document.getElementById('game-panel').classList.contains('hidden'));
+  assert.strictEqual(env.document.getElementById('call-screen').hasAttribute('data-game'), false);
+});
+
+test('an invitation is shown and can be accepted', async () => {
+  const env = createBrowser();
+  const { app, outbox, them } = await twoPlayerCall(env);
+
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  const invite = env.document.getElementById('game-invite');
+  assert.ok(!invite.classList.contains('hidden'), 'the invitation is visible');
+  assert.match(env.document.getElementById('game-invite-from').textContent, /приглашает/);
+
+  app.acceptGameInvite();
+  assert.ok(invite.classList.contains('hidden'));
+  assert.ok(app.game, 'the game is running');
+  assert.strictEqual(app.gameOpponentId, them);
+  assert.strictEqual(env.document.getElementById('call-screen').getAttribute('data-game'), 'on');
+  assert.ok(outbox.some((m) => m.kind === 'game' && m.op === 'accept'));
+  app.endGame();
+});
+
+test('opening a game does not disturb the video grid', async () => {
+  // The board is a sibling of #videos-container on purpose: updateGridLayout()
+  // counts that container's children, so a board inside it would shift every
+  // [data-participants] rule.
+  const env = createBrowser();
+  const { app, them } = await twoPlayerCall(env);
+  app.addVideoStream(them, fakeStream(['audio', 'video']), false);
+  const container = env.document.getElementById('videos-container');
+  const before = container.getAttribute('data-participants');
+
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+
+  assert.strictEqual(container.getAttribute('data-participants'), before);
+  assert.strictEqual(container.getAttribute('data-layout'), 'grid', 'spotlight is meaningless in a strip');
+  app.endGame();
+});
+
+test('the stored layout choice comes back when the game ends', async () => {
+  const env = createBrowser();
+  const { app, them } = await twoPlayerCall(env);
+  app.layoutMode = 'sidebar';
+  app.addVideoStream(them, fakeStream(['audio', 'video']), false);
+
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+  assert.strictEqual(app.getEffectiveLayout(2), 'grid');
+
+  app.endGame();
+  assert.strictEqual(app.layoutMode, 'sidebar', 'the stored mode was never touched');
+  assert.strictEqual(app.getEffectiveLayout(2), 'sidebar');
+});
+
+test('only the opponent can drive the game', async () => {
+  // In a five-person room a third party must not be able to move the ball.
+  const env = createBrowser();
+  const { app, them } = await twoPlayerCall(env);
+  app.participants.set('mmmm', { id: 'mmmm', name: 'M' });
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+
+  const before = app.game.hostX;
+  await gameMsg(app, 'mmmm', { op: 'state', bx: 10, by: 10, vx: 0, vy: 0, hx: 5, gx: 5 });
+  assert.strictEqual(app.game.hostX, before, 'a stranger cannot move anything');
+  app.endGame();
+});
+
+test('a hostile state message cannot poison the board', async () => {
+  const env = createBrowser();
+  const { app, them } = await twoPlayerCall(env);
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+  app.game.isHost = false; // only the guest applies state
+
+  for (const bad of [
+    { bx: NaN, by: 1, vx: 1, vy: 1, hx: 1, gx: 1 },
+    { bx: 1e400, by: 1, vx: 1, vy: 1, hx: 1, gx: 1 },
+    { bx: 1, by: 1, vx: 'x', vy: 1, hx: 1, gx: 1 },
+    { bx: 1, by: 1, vx: 1, vy: 1, hx: null, gx: 1 },
+  ]) {
+    await gameMsg(app, them, { op: 'state', ...bad });
+  }
+  assert.strictEqual(app.game.remote, null, 'nothing invalid was accepted');
+  assert.ok(Number.isFinite(app.game.hostX));
+
+  await gameMsg(app, them, { op: 'state', bx: 50, by: 60, vx: 10, vy: 20, hx: 100, gx: 120 });
+  assert.ok(app.game.remote, 'a valid snapshot still applies');
+  assert.strictEqual(app.game.hostX, 100);
+  app.endGame();
+});
+
+test('a peer leaving ends the game and restores the screen', async () => {
+  const env = createBrowser();
+  const { app, them } = await twoPlayerCall(env);
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+  assert.ok(app.game);
+
+  app.handlePeerLeft(them);
+
+  assert.strictEqual(app.game, null, 'the render loop is stopped');
+  assert.strictEqual(app.gameOpponentId, null);
+  assert.ok(env.document.getElementById('game-panel').classList.contains('hidden'));
+  assert.strictEqual(env.document.getElementById('call-screen').hasAttribute('data-game'), false);
+});
+
+test('a peer reconnecting ends the game rather than freezing it', async () => {
+  // _dropPeerSession kills the data channel; a game left running would just
+  // stop with nothing on screen to explain why.
+  const env = createBrowser();
+  const { app, socket, them } = await twoPlayerCall(env);
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+
+  socket.deliver({ type: 'peer-joined', clientId: them });
+  await tick();
+
+  assert.strictEqual(app.game, null);
+  assert.strictEqual(env.document.getElementById('call-screen').hasAttribute('data-game'), false);
+});
+
+test('ending the call stops the game', async () => {
+  const env = createBrowser();
+  const { app, them } = await twoPlayerCall(env);
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+
+  app.endCall();
+
+  assert.strictEqual(app.game, null, 'no render loop outlives the call');
+  assert.ok(env.document.getElementById('game-panel').classList.contains('hidden'));
+});
+
+test('game traffic goes only to the opponent', async () => {
+  const env = createBrowser();
+  const { app, outbox, them } = await twoPlayerCall(env);
+  const bystander = attachControlChannel(app, 'mmmm');
+  app.participants.set('mmmm', { id: 'mmmm', name: 'M' });
+
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+  outbox.length = 0;
+  app._sendGame({ op: 'state', bx: 1, by: 1, vx: 0, vy: 0, hx: 1, gx: 1 });
+
+  assert.strictEqual(outbox.filter((m) => m.kind === 'game').length, 1);
+  assert.strictEqual(bystander.length, 0, 'bystanders never see game traffic');
+  app.endGame();
+});
+
+test('a backed-up channel drops game ticks instead of queueing them', async () => {
+  // Dropping a tick is free — the next snapshot supersedes it. Letting them
+  // queue would delay an E2EE key behind them on the same ordered channel.
+  const env = createBrowser();
+  const { app, outbox, them } = await twoPlayerCall(env);
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+  outbox.length = 0;
+
+  app.controlChannels.get(them).bufferedAmount = 200 * 1024;
+  const sent = app._sendGame({ op: 'state', bx: 1, by: 1, vx: 0, vy: 0, hx: 1, gx: 1 });
+
+  assert.strictEqual(sent, false);
+  assert.strictEqual(outbox.length, 0);
+  app.endGame();
+});
+
+test('the invite is refused when it cannot reach the peer', async () => {
+  const env = createBrowser();
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+
+  app.inviteToGame('zzzz'); // no control channel attached
+  assert.strictEqual(app.invitedPeer, null);
+  assert.match(env.document.getElementById('toast').textContent, /соединени/i);
+});
+
+test('the guest stops showing the countdown once the ball is live', async () => {
+  // The guest never runs the simulation, so a state message is the only thing
+  // that can clear the "get ready" overlay for it.
+  const env = createBrowser();
+  const { app, them } = await twoPlayerCall(env, { me: 'zzzz', them: 'aaaa' });
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+  assert.strictEqual(app.game.isHost, false, 'aaaa < zzzz, so they simulate');
+
+  const message = env.document.getElementById('game-message');
+  assert.ok(!message.classList.contains('hidden'), 'the countdown is up');
+
+  await gameMsg(app, them, { op: 'state', bx: 150, by: 200, vx: 0, vy: 0, hx: 150, gx: 150 });
+  assert.ok(!message.classList.contains('hidden'), 'a frozen ball is still the countdown');
+
+  await gameMsg(app, them, { op: 'state', bx: 150, by: 200, vx: 40, vy: 120, hx: 150, gx: 150 });
+  assert.ok(message.classList.contains('hidden'), 'the ball moved, so the overlay clears');
+  app.endGame();
+});
+
+test('the host awards the point and tells the guest', async () => {
+  const env = createBrowser();
+  const { app, outbox, them } = await twoPlayerCall(env, { me: 'aaaa', them: 'zzzz' });
+  await gameMsg(app, them, { op: 'invite', v: 1 });
+  app.acceptGameInvite();
+  assert.strictEqual(app.game.isHost, true, 'aaaa < zzzz, so we simulate');
+
+  outbox.length = 0;
+  app.game.freezeMs = 0;
+  app.game.ball = { x: 150, y: 395, vx: 0, vy: 200 };
+  app.game.hostX = 10; // nowhere near the ball
+  app.game._step(0.2);
+
+  assert.strictEqual(app.game.theirScore, 1, 'the ball went past us');
+  const score = outbox.find((m) => m.op === 'score');
+  assert.ok(score);
+  assert.strictEqual(score.h, 0);
+  assert.strictEqual(score.g, 1);
+  app.endGame();
 });
 
 // --- E2EE key agreement -----------------------------------------------------
