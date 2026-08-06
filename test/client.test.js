@@ -334,22 +334,71 @@ test('a match replaces the waiting screen with the call', async () => {
   );
 });
 
-test('reconnecting while queued re-asks instead of waiting forever', async () => {
+test('a socket dropping while queued reconnects on its own', async () => {
+  // The old version of this test dispatched 'online' by hand, which forces a
+  // reconnect — so it passed while the app, left to itself, sat on a spinner
+  // for a match that could never arrive, camera running the whole time.
   const env = createBrowser();
   const app = new env.CallingApp();
   env.lastSocket().open();
   await app.startWaiting(3);
+  const before = env.sockets.length;
 
   env.lastSocket().close();
-  await tick();
-  env.window.dispatchEvent(new env.window.Event('online'));
-  await tick();
+  await tick(1300); // past the first backoff step
+
+  assert.ok(env.sockets.length > before, 'a reconnect was scheduled without any nudge');
   const reconnected = env.lastSocket();
   reconnected.open();
 
   const wait = reconnected.sent.filter((m) => m.type === 'wait').pop();
-  assert.ok(wait, 'the queue request is re-sent');
+  assert.ok(wait, 'and the queue request is re-sent');
   assert.strictEqual(wait.size, 3, 'with the same size, which the server treats as idempotent');
+});
+
+test('a refused wait does not leave a searching screen and a live camera', async () => {
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  const socket = env.lastSocket();
+  socket.open();
+  await app.startWaiting(2);
+  const stream = app.localStream;
+
+  socket.deliver({ type: 'error', code: 'too-many-waiting', text: 'Слишком много ожиданий' });
+  await tick();
+
+  assert.strictEqual(app._waitingSize, null);
+  assert.strictEqual(app.localStream, null);
+  assert.ok(stream.getTracks().every((t) => t.readyState === 'ended'));
+  assert.strictEqual(
+    env.document.getElementById('waiting-panel').classList.contains('hidden'),
+    true
+  );
+});
+
+test('a match that lands just after cancelling is refused', async () => {
+  // The server can seat us in the same instant we back out. Accepting would
+  // put the user in a stranger's call they had already left, camera and all.
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  const socket = env.lastSocket();
+  socket.open();
+  await app.startWaiting(2);
+  app.cancelWaiting();
+
+  socket.deliver({
+    type: 'joined',
+    roomId: 'LATE01',
+    clientId: 'aaaa',
+    participants: ['zzzz'],
+    resumeToken: 'a'.repeat(64),
+    matched: true,
+  });
+  await tick(40);
+
+  assert.strictEqual(app.roomId, null, 'we do not end up in the call');
+  assert.strictEqual(app.localStream, null, 'and the camera stays off');
+  assert.ok(socket.sent.some((m) => m.type === 'leave'), 'the seat is given back');
 });
 
 test('the queue timing out tells the user and frees the camera', async () => {

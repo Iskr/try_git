@@ -25,6 +25,9 @@ const CONFIG_FETCH_TIMEOUT_MS = 5000;
 // How long the room has to agree before a proposal to switch encryption off
 // lapses. Silence is a refusal, so this only ever fails closed.
 const E2EE_VOTE_TIMEOUT_MS = 20000;
+// How long after cancelling a wait a 'joined' is still treated as the match we
+// backed out of rather than a call we asked for.
+const CANCELLED_MATCH_WINDOW_MS = 10000;
 
 const AUDIO_CONSTRAINTS = {
     echoCancellation: true,
@@ -986,7 +989,13 @@ class CallingApp {
                 this.pendingJoinRoomId = this._lastRequestedRoom;
             }
 
-            if (this.roomId || this.pendingJoinRoomId) {
+            // Queued for a random call counts too: without it a dropped socket
+            // leaves the user watching a spinner for a match that can never
+            // arrive, with the camera on the whole time.
+            // Queued for a random call counts too: without it a dropped socket
+            // leaves the user watching a spinner for a match that can never
+            // arrive, with the camera on the whole time.
+            if (this.roomId || this.pendingJoinRoomId || this._waitingSize) {
                 this.updateConnectionStatus('Переподключение...', false);
                 this._scheduleReconnect();
             }
@@ -1158,12 +1167,7 @@ class CallingApp {
                 break;
 
             case 'waiting-expired':
-                this._stopWaiting();
-                this._mediaGeneration += 1;
-                if (this.localStream) {
-                    this.localStream.getTracks().forEach(t => t.stop());
-                    this.localStream = null;
-                }
+                this._abandonWaiting();
                 this.showToast('Никого не нашлось — попробуйте ещё раз');
                 break;
 
@@ -1199,13 +1203,27 @@ class CallingApp {
                         this.endCall();
                     }
                 }
+                // A refused 'wait' would otherwise leave a "searching" screen
+                // for a queue we are not in, with the camera running.
+                if (this._waitingSize) this._abandonWaiting();
                 break;
         }
     }
 
     async handleJoined(message) {
+        // A match the server made just as we cancelled. Accepting it would put
+        // the user in a stranger's call they had already backed out of, and
+        // switch the camera on again to do it.
+        if (message.matched && !this._waitingSize &&
+            this._cancelledWaitAt && Date.now() - this._cancelledWaitAt < CANCELLED_MATCH_WINDOW_MS) {
+            console.warn('Refusing a match that landed after we cancelled');
+            this._sendWs({ type: 'leave' });
+            return;
+        }
+
         this._joining = false;
         this._rejoining = false;
+        this._cancelledWaitAt = 0;
         if (this._waitingSize) this._stopWaiting();
         clearTimeout(this._pendingVote && this._pendingVote.timer);
         this._pendingVote = null;
@@ -1473,9 +1491,17 @@ class CallingApp {
     cancelWaiting() {
         if (!this._waitingSize) return;
         this._sendWs({ type: 'unwait' });
+        // Remembered so a 'joined' already in flight — the server matched us in
+        // the same instant we cancelled — is refused instead of dropping the
+        // user into a stranger's call and switching the camera back on.
+        this._cancelledWaitAt = Date.now();
+        this._abandonWaiting();
+    }
+
+    // Stop waiting and give the camera back. Anything that ends a wait without
+    // the user starting a call goes through here, or the light stays on.
+    _abandonWaiting() {
         this._stopWaiting();
-        // Nothing is going to use this stream now, and the camera light staying
-        // on after cancelling reads as the app still watching.
         this._mediaGeneration += 1;
         if (this.localStream) {
             this.localStream.getTracks().forEach(t => t.stop());

@@ -876,6 +876,10 @@ function reapDeadEntries() {
     });
     if (room.size === 0) {
       rooms.delete(roomId);
+      // The roster has to go with the room. Left behind it both leaks and
+      // poisons the id: a later room reusing it would refuse everyone,
+      // because nobody would be on the stale roster.
+      matchedRooms.delete(roomId);
     }
   });
 }
