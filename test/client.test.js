@@ -245,6 +245,130 @@ test('the host sees its own paddle at its own end of the board', async () => {
   app.endGame();
 });
 
+test('waiting for a random call takes the camera before queueing', async () => {
+  // The match can land minutes later, outside any user gesture, and iOS will
+  // not reliably grant a first-time camera prompt then.
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  env.lastSocket().open();
+
+  await app.startWaiting(2);
+
+  assert.strictEqual(env.media.calls.length, 1, 'the camera was taken first');
+  assert.ok(app.localStream);
+  const wait = env.lastSocket().sent.filter((m) => m.type === 'wait').pop();
+  assert.strictEqual(wait.size, 2);
+  assert.strictEqual(
+    env.document.getElementById('waiting-panel').classList.contains('hidden'),
+    false
+  );
+});
+
+test('a denied camera never costs a stranger their slot', async () => {
+  const env = createBrowser({
+    getUserMedia: async () => {
+      const error = new Error('denied');
+      error.name = 'NotAllowedError';
+      throw error;
+    },
+  });
+  const app = new env.CallingApp();
+  env.lastSocket().open();
+
+  await app.startWaiting(2);
+
+  assert.strictEqual(
+    env.lastSocket().sent.filter((m) => m.type === 'wait').length,
+    0,
+    'we never queued'
+  );
+  assert.strictEqual(app._waitingSize, null);
+});
+
+test('cancelling the wait releases the camera', async () => {
+  // The light staying on after cancelling reads as the app still watching.
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  env.lastSocket().open();
+  await app.startWaiting(2);
+  const stream = app.localStream;
+
+  app.cancelWaiting();
+
+  assert.ok(env.lastSocket().sent.some((m) => m.type === 'unwait'));
+  assert.strictEqual(app._waitingSize, null);
+  assert.strictEqual(app.localStream, null);
+  assert.ok(stream.getTracks().every((t) => t.readyState === 'ended'));
+  assert.strictEqual(
+    env.document.getElementById('waiting-panel').classList.contains('hidden'),
+    true
+  );
+});
+
+test('a match replaces the waiting screen with the call', async () => {
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  const socket = env.lastSocket();
+  socket.open();
+  await app.startWaiting(2);
+
+  socket.deliver({
+    type: 'joined',
+    roomId: 'MATCH1',
+    clientId: 'aaaa',
+    participants: ['zzzz'],
+    resumeToken: 'a'.repeat(64),
+    matched: true,
+  });
+  await tick(40);
+
+  assert.strictEqual(app._waitingSize, null, 'no longer waiting');
+  assert.strictEqual(app.roomId, 'MATCH1');
+  assert.strictEqual(
+    env.document.getElementById('waiting-panel').classList.contains('hidden'),
+    true
+  );
+  assert.strictEqual(
+    env.document.getElementById('call-screen').classList.contains('active'),
+    true
+  );
+});
+
+test('reconnecting while queued re-asks instead of waiting forever', async () => {
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  env.lastSocket().open();
+  await app.startWaiting(3);
+
+  env.lastSocket().close();
+  await tick();
+  env.window.dispatchEvent(new env.window.Event('online'));
+  await tick();
+  const reconnected = env.lastSocket();
+  reconnected.open();
+
+  const wait = reconnected.sent.filter((m) => m.type === 'wait').pop();
+  assert.ok(wait, 'the queue request is re-sent');
+  assert.strictEqual(wait.size, 3, 'with the same size, which the server treats as idempotent');
+});
+
+test('the queue timing out tells the user and frees the camera', async () => {
+  const env = createBrowser();
+  const app = new env.CallingApp();
+  const socket = env.lastSocket();
+  socket.open();
+  await app.startWaiting(2);
+  const stream = app.localStream;
+
+  socket.deliver({ type: 'waiting-expired' });
+  await tick();
+
+  assert.strictEqual(app._waitingSize, null);
+  assert.strictEqual(app.localStream, null);
+  assert.ok(stream.getTracks().every((t) => t.readyState === 'ended'));
+  assert.match(env.document.getElementById('toast').textContent, /попробуйте/i);
+});
+
 test('a refused camera inside Telegram points at Safari, not at browser settings', async () => {
   // Calls do work in Telegram's webview, so nothing is said up front — but if
   // the camera is refused there, there is no permission screen to send the

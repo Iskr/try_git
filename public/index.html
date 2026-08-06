@@ -39,6 +39,31 @@
                 </button>
             </div>
 
+            <button id="random-call-btn" class="btn btn-secondary random-call-btn">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="9"></circle>
+                    <path d="M8 12h8M12 8v8"></path>
+                </svg>
+                Случайный звонок
+            </button>
+
+            <div id="random-size" class="random-size hidden">
+                <span class="random-size-label">Сколько человек в звонке?</span>
+                <div class="random-size-options" role="group" aria-label="Размер группы">
+                    <button class="random-size-btn" data-size="2">2</button>
+                    <button class="random-size-btn" data-size="3">3</button>
+                    <button class="random-size-btn" data-size="4">4</button>
+                    <button class="random-size-btn" data-size="5">5</button>
+                </div>
+            </div>
+
+            <div id="waiting-panel" class="waiting-panel hidden" role="status" aria-live="polite">
+                <div class="waiting-spinner" aria-hidden="true"></div>
+                <div class="waiting-text" id="waiting-text">Ищем собеседника…</div>
+                <video id="waiting-preview" class="waiting-preview" autoplay playsinline muted></video>
+                <button id="waiting-cancel-btn" class="btn btn-secondary">Отменить</button>
+            </div>
+
             <div id="join-input-container" class="input-container hidden">
                 <input type="text" id="room-id-input" placeholder="Введите код звонка"
                        maxlength="6" autocomplete="off" autocapitalize="characters"

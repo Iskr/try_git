@@ -283,6 +283,108 @@ h1 {
     transform: translateY(-1px);
 }
 
+/* Random call */
+.random-call-btn {
+    margin-top: 12px;
+    width: 100%;
+    max-width: 400px;
+}
+
+@media (min-width: 769px) {
+    .random-call-btn {
+        max-width: 600px;
+    }
+}
+
+.random-size,
+.waiting-panel {
+    margin-top: 20px;
+    width: 100%;
+    max-width: 400px;
+    animation: fadeIn 0.3s ease;
+}
+
+.random-size.hidden,
+.waiting-panel.hidden {
+    display: none;
+}
+
+.random-size-label {
+    display: block;
+    font-size: 14px;
+    color: var(--text-secondary);
+    margin-bottom: 10px;
+}
+
+.random-size-options {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+}
+
+.random-size-btn {
+    padding: 14px 0;
+    border-radius: var(--radius-md);
+    border: 2px solid var(--border-color);
+    background: var(--surface-color);
+    color: var(--text-color);
+    font-size: 17px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    -webkit-tap-highlight-color: transparent;
+}
+
+.random-size-btn:hover {
+    border-color: var(--primary-color);
+    color: var(--primary-color);
+}
+
+.waiting-panel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+}
+
+.waiting-spinner {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 3px solid var(--border-color);
+    border-top-color: var(--primary-color);
+    animation: waitingSpin 0.9s linear infinite;
+}
+
+@keyframes waitingSpin {
+    to { transform: rotate(360deg); }
+}
+
+/* Reduced motion still needs a sign of life, so it pulses instead */
+@media (prefers-reduced-motion: reduce) {
+    .waiting-spinner {
+        animation: fadeIn 1.2s ease-in-out infinite alternate;
+    }
+}
+
+.waiting-text {
+    font-size: 16px;
+    color: var(--text-color);
+    text-align: center;
+}
+
+/* The preview is the visible payoff of capturing the camera before queueing:
+   the match can land minutes later, long outside a user gesture, and iOS will
+   not reliably grant a first-time camera prompt then. */
+.waiting-preview {
+    width: 160px;
+    height: 120px;
+    object-fit: cover;
+    border-radius: var(--radius-md);
+    background: #1a1a1a;
+    transform: scaleX(-1);
+}
+
 /* Call Screen */
 #call-screen {
     padding: 0;

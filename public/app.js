@@ -645,6 +645,8 @@ class CallingApp {
         this.pendingJoinRoomId = null;
         this._lastRequestedRoom = null;
         this._joining = false;
+        // Set while queued for a random call, so a reconnect can re-ask.
+        this._waitingSize = null;
         // Set while a rejoin is in flight so a room-full/error reply can be
         // told apart from an unrelated mid-call error.
         this._rejoining = false;
@@ -869,6 +871,12 @@ class CallingApp {
             if (!document.hidden) this._resumeAfterInterruption();
         });
 
+        document.getElementById('random-call-btn').addEventListener('click', () => this.toggleRandomSizes());
+        document.querySelectorAll('.random-size-btn').forEach((btn) => {
+            btn.addEventListener('click', () => this.startWaiting(parseInt(btn.dataset.size, 10)));
+        });
+        document.getElementById('waiting-cancel-btn').addEventListener('click', () => this.cancelWaiting());
+
         this.shuffleReactionsButton();
 
         // Check URL for room ID
@@ -905,7 +913,11 @@ class CallingApp {
             console.log('WebSocket connected');
             this._wsReconnectAttempt = 0;
 
-            if (this.pendingJoinRoomId) {
+            if (this._waitingSize && !this.roomId) {
+                // Re-asking with the same size is idempotent server-side, so
+                // this cannot cost us our place in the queue.
+                this._sendWs({ type: 'wait', size: this._waitingSize });
+            } else if (this.pendingJoinRoomId) {
                 const roomId = this.pendingJoinRoomId;
                 this.pendingJoinRoomId = null;
                 this._sendWs({ type: 'join', roomId });
@@ -1111,6 +1123,31 @@ class CallingApp {
                 this.handlePeerLeft(message.clientId);
                 break;
 
+            case 'waiting':
+                if (this._waitingSize) {
+                    const need = message.size || this._waitingSize;
+                    this._setWaitingText(
+                        Number.isInteger(message.queued) && message.queued < need
+                            ? `Ждём ещё ${need - message.queued} из ${need}…`
+                            : 'Ищем собеседника…'
+                    );
+                }
+                break;
+
+            case 'waiting-cancelled':
+                this._stopWaiting();
+                break;
+
+            case 'waiting-expired':
+                this._stopWaiting();
+                this._mediaGeneration += 1;
+                if (this.localStream) {
+                    this.localStream.getTracks().forEach(t => t.stop());
+                    this.localStream = null;
+                }
+                this.showToast('Никого не нашлось — попробуйте ещё раз');
+                break;
+
             case 'room-full':
                 this._joining = false;
                 if (this._rejoining) {
@@ -1150,6 +1187,7 @@ class CallingApp {
     async handleJoined(message) {
         this._joining = false;
         this._rejoining = false;
+        if (this._waitingSize) this._stopWaiting();
         this._rejoinRetryAttempt = 0;
         clearTimeout(this._rejoinRetryTimer);
         this.roomId = message.roomId;
@@ -1356,6 +1394,74 @@ class CallingApp {
             default:
                 return 'Не удалось получить доступ к камере/микрофону';
         }
+    }
+
+    toggleRandomSizes() {
+        if (this._waitingSize) {
+            this.cancelWaiting();
+            return;
+        }
+        document.getElementById('random-size').classList.toggle('hidden');
+    }
+
+    // The camera is taken BEFORE queueing, for two reasons: a match can land
+    // minutes later, long outside the user gesture iOS wants for a first-time
+    // prompt; and a stranger's slot must not be spent on someone who is about
+    // to deny the camera.
+    async startWaiting(size) {
+        if (!Number.isInteger(size) || this._waitingSize || this.roomId) return;
+        document.getElementById('random-size').classList.add('hidden');
+
+        this.ensureAudioContext();
+        try {
+            await this.acquireLocalMedia();
+        } catch (error) {
+            this.showToast(this.mediaErrorMessage(error));
+            return;
+        }
+        if (!this.localStream) return;
+
+        const preview = document.getElementById('waiting-preview');
+        preview.srcObject = this.localStream;
+        preview.play().catch(() => { /* muted preview, not critical */ });
+
+        this._waitingSize = size;
+        this._setWaitingText(`Ищем ${size === 2 ? 'собеседника' : 'участников'}…`);
+        document.getElementById('waiting-panel').classList.remove('hidden');
+
+        if (!this._sendWs({ type: 'wait', size })) {
+            // Not connected yet — connectWebSocket's onopen re-sends it.
+            this.showToast('Подключение к серверу...');
+            if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+                this._cancelReconnect();
+                this.connectWebSocket();
+            }
+        }
+    }
+
+    cancelWaiting() {
+        if (!this._waitingSize) return;
+        this._sendWs({ type: 'unwait' });
+        this._stopWaiting();
+        // Nothing is going to use this stream now, and the camera light staying
+        // on after cancelling reads as the app still watching.
+        this._mediaGeneration += 1;
+        if (this.localStream) {
+            this.localStream.getTracks().forEach(t => t.stop());
+            this.localStream = null;
+        }
+    }
+
+    _stopWaiting() {
+        this._waitingSize = null;
+        const preview = document.getElementById('waiting-preview');
+        preview.pause();
+        preview.srcObject = null;
+        document.getElementById('waiting-panel').classList.add('hidden');
+    }
+
+    _setWaitingText(text) {
+        document.getElementById('waiting-text').textContent = text;
     }
 
     async startCall() {
@@ -3058,6 +3164,7 @@ class CallingApp {
         this._rejoinRetryAttempt = 0;
         clearTimeout(this._rejoinRetryTimer);
         this._mediaPromise = null;
+        if (this._waitingSize) this._stopWaiting();
         this.participants.clear();
         this.isAudioEnabled = true;
         this.isVideoEnabled = true;
