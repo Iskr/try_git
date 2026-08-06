@@ -1124,16 +1124,142 @@ test('agreeing then receiving the result switches us off', async () => {
   app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
   attachControlChannel(app, 'aaaa');
 
+  const result = {
+    kind: 'e2ee-off',
+    voteId: 'v2',
+    peers: ['aaaa', 'zzzz'],
+    agreed: ['aaaa', 'zzzz'],
+  };
+
   await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off-request', voteId: 'v2' }));
   app.answerDisableRequest(true);
-  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off', voteId: 'v2' }));
+  await app.handleControlMessage('aaaa', JSON.stringify(result));
 
   assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
 
   // ...and the same announcement replayed later does nothing
   await app.enableEncryption({ silent: true });
-  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off', voteId: 'v2' }));
+  await app.handleControlMessage('aaaa', JSON.stringify(result));
   assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'a replayed result is spent');
+});
+
+test('a vote held over part of the room does not switch anyone off', async () => {
+  // Otherwise a member sends the request to one person instead of the room,
+  // that person believes everyone was polled, agrees, and drops to plaintext
+  // alone — visible to whoever runs the relay, and dropped by everyone else.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  ['aaaa', 'mmmm'].forEach((id) => app.participants.set(id, { id, name: id }));
+  attachControlChannel(app, 'aaaa');
+  attachControlChannel(app, 'mmmm');
+
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off-request', voteId: 'v3' }));
+  app.answerDisableRequest(true);
+
+  // 'mmmm' is in the room but not in the announced vote
+  await app.handleControlMessage('aaaa', JSON.stringify({
+    kind: 'e2ee-off', voteId: 'v3', peers: ['aaaa', 'zzzz'], agreed: ['aaaa', 'zzzz'],
+  }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true, 'a partial vote decides nothing');
+});
+
+test('an agreement can only be spent by the peer it was given to', async () => {
+  // Proposals are broadcast, so every member learns every vote id. Without
+  // this check any of them could keep an old "yes" and cash it in later.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  ['aaaa', 'mmmm'].forEach((id) => app.participants.set(id, { id, name: id }));
+  attachControlChannel(app, 'aaaa');
+  attachControlChannel(app, 'mmmm');
+
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off-request', voteId: 'v4' }));
+  app.answerDisableRequest(true);
+
+  // 'mmmm' merely overheard the id and announces the result itself
+  await app.handleControlMessage('mmmm', JSON.stringify({
+    kind: 'e2ee-off', voteId: 'v4',
+    peers: ['aaaa', 'mmmm', 'zzzz'], agreed: ['aaaa', 'mmmm', 'zzzz'],
+  }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+});
+
+test('an agreement lapses with the vote it belonged to', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  attachControlChannel(app, 'aaaa');
+
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off-request', voteId: 'v5' }));
+  app.answerDisableRequest(true);
+  // The vote is over; the proposer went quiet and only comes back much later
+  app._agreedVotes.get('v5').expiresAt = Date.now() - 1;
+
+  await app.handleControlMessage('aaaa', JSON.stringify({
+    kind: 'e2ee-off', voteId: 'v5', peers: ['aaaa', 'zzzz'], agreed: ['aaaa', 'zzzz'],
+  }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+  assert.strictEqual(app._agreedVotes.has('v5'), false, 'and the stale token is dropped');
+});
+
+test('a departing proposer takes its prompt and its promise with it', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'zzzz' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  attachControlChannel(app, 'aaaa');
+
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-off-request', voteId: 'v6' }));
+  assert.strictEqual(
+    env.document.getElementById('e2ee-vote').classList.contains('hidden'),
+    false
+  );
+
+  app.handlePeerLeft('aaaa');
+
+  assert.strictEqual(
+    env.document.getElementById('e2ee-vote').classList.contains('hidden'),
+    true,
+    'the prompt from someone who left is taken down'
+  );
+  assert.strictEqual(app._incomingVote, null);
+});
+
+test('joining a room that voted encryption off does not turn it back on', async () => {
+  // This is the case the vote exists for: a participant who cannot encrypt.
+  // Re-enabling on the next join would make them vanish all over again.
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'aaaa' });
+  app.participants.set('zzzz', { id: 'zzzz', name: 'Z' });
+  attachControlChannel(app, 'zzzz');
+
+  app._applyDisableEncryption();
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+
+  // A newcomer arrives with a key of its own
+  const outbox = attachControlChannel(app, 'nnnn');
+  app.participants.set('nnnn', { id: 'nnnn', name: 'N' });
+  await app.handleRemoteEncryptionKey('nnnn', keyOf(7), 'nnnn', 1);
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false, 'the room keeps its decision');
+  assert.ok(
+    outbox.some((m) => m.kind === 'e2ee-room-off'),
+    'and the newcomer is told why rather than left guessing'
+  );
+});
+
+test('a newcomer told the room is off follows it', async () => {
+  const env = createBrowser({ frameEncryption: true });
+  const { app } = await joinedApp(env, { clientId: 'nnnn' });
+  app.participants.set('aaaa', { id: 'aaaa', name: 'A' });
+  attachControlChannel(app, 'aaaa');
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, true);
+
+  await app.handleControlMessage('aaaa', JSON.stringify({ kind: 'e2ee-room-off' }));
+
+  assert.strictEqual(app.frameCryptor.encryptionEnabled, false);
+  assert.match(env.document.getElementById('toast').textContent, /общему решению/);
 });
 
 test('a peer that cannot encrypt puts it to the room rather than vanishing', async () => {

@@ -670,9 +670,17 @@ class CallingApp {
         // Turning encryption off needs everyone's agreement. A peer only ever
         // switches off for a vote it agreed to itself, so a lone member cannot
         // drop the room to plaintext by sending 'e2ee-off' out of the blue.
-        this._agreedVotes = new Set();
+        // voteId -> { from, expiresAt }. An agreement is bound to the peer we
+        // gave it to and dies with the vote: otherwise any member could keep a
+        // stranger's old "yes" and cash it in whenever it suited them.
+        this._agreedVotes = new Map();
         this._pendingVote = null;
         this._incomingVote = null;
+        // The room decided to be off. Without this, the next person to join —
+        // or anyone's socket reconnecting — silently turns it back on for
+        // everybody, which for the case it exists to serve (a participant who
+        // cannot encrypt) makes them vanish again.
+        this._e2eeVotedOff = false;
 
         this.rtcConfig = DEFAULT_RTC_CONFIG;
         this.maxParticipants = MAX_PARTICIPANTS;
@@ -1203,6 +1211,7 @@ class CallingApp {
         this._pendingVote = null;
         this._incomingVote = null;
         this._agreedVotes.clear();
+        this._e2eeVotedOff = false;
         this._hideVotePrompt();
         this._rejoinRetryAttempt = 0;
         clearTimeout(this._rejoinRetryTimer);
@@ -1226,7 +1235,7 @@ class CallingApp {
         // converges on one by the (epoch, owner) ordering. Doing it this way
         // rather than electing an owner first means media is encrypted from
         // the first frame instead of from whenever an election settles.
-        await this.enableEncryption({ silent: true });
+        if (!this._e2eeVotedOff) await this.enableEncryption({ silent: true });
 
         const others = Array.isArray(message.participants) ? message.participants : [];
         for (const participantId of others) {
@@ -1979,6 +1988,14 @@ class CallingApp {
             case 'e2ee-off':
                 this.handleRemoteEncryptionDisabled(senderId, message);
                 break;
+            case 'e2ee-room-off':
+                // From a member of a room that already voted encryption off.
+                // We are the newcomer here, so we follow the room.
+                if (this.frameCryptor.encryptionEnabled && !this._e2eeVotedOff) {
+                    this._applyDisableEncryption();
+                    this.showToast('В этом звонке шифрование выключено по общему решению');
+                }
+                break;
             case 'e2ee-off-request':
                 this.handleDisableRequest(senderId, message);
                 break;
@@ -2298,6 +2315,12 @@ class CallingApp {
             this.sendControl(senderId, { kind: 'e2ee-unsupported' });
             return;
         }
+        if (this._e2eeVotedOff) {
+            // Somebody joined and started encrypting again. Tell them what the
+            // room decided rather than quietly following them back on.
+            this.sendControl(senderId, { kind: 'e2ee-room-off' });
+            return;
+        }
         const keyOwner = typeof owner === 'string' && owner ? owner : senderId;
         const keyEpoch = Number.isInteger(epoch) && epoch > 0 ? epoch : 1;
 
@@ -2338,13 +2361,39 @@ class CallingApp {
     handleRemoteEncryptionDisabled(senderId, message) {
         if (!this.frameCryptor.encryptionEnabled) return;
         const voteId = message && message.voteId;
-        // The only thing that can switch us off is the result of a vote we
-        // agreed to. A member sending 'e2ee-off' on its own - or replaying an
-        // old one - changes nothing here.
-        if (typeof voteId !== 'string' || !this._agreedVotes.has(voteId)) {
+        if (typeof voteId !== 'string') return;
+
+        const entry = this._agreedVotes.get(voteId);
+        // Only the result of a vote we agreed to, announced by the peer we
+        // agreed with, while it is still current. Anything else — a bare
+        // 'e2ee-off', an old agreement replayed later, a result announced by a
+        // bystander who merely overheard the id — changes nothing.
+        if (!entry) {
             console.warn('Ignoring e2ee-off without our agreement, from', senderId);
             return;
         }
+        if (entry.from !== senderId) {
+            console.warn('Ignoring e2ee-off announced by someone other than the proposer');
+            return;
+        }
+        if (Date.now() > entry.expiresAt) {
+            this._agreedVotes.delete(voteId);
+            console.warn('Ignoring e2ee-off for a vote that has lapsed');
+            return;
+        }
+
+        // The proposer says who it asked; that has to cover everyone we can
+        // see, or "unanimous" was decided over a smaller room than ours.
+        const asked = new Set(Array.isArray(message.peers) ? message.peers : []);
+        const agreed = new Set(Array.isArray(message.agreed) ? message.agreed : []);
+        const mine = [this.clientId, senderId, ...this.controlChannels.keys()];
+        const missing = mine.filter((id) => !asked.has(id) || !agreed.has(id));
+        if (missing.length > 0) {
+            console.warn('Ignoring e2ee-off: the vote did not cover', missing);
+            this.showToast('Голосование прошло не по всем участникам — шифрование остаётся');
+            return;
+        }
+
         this._agreedVotes.delete(voteId);
         console.log('Encryption disabled by agreement, announced by:', senderId);
         this._applyDisableEncryption();
@@ -2684,6 +2733,7 @@ class CallingApp {
         this._clearNegotiationWatchdog(clientId);
         this._iceRestartAttempts.delete(clientId);
         this._peerReconnectAttempts.delete(clientId);
+        this._forgetVotesWith(clientId);
 
         // Close peer connection
         const pc = this.peerConnections.get(clientId);
@@ -2867,7 +2917,7 @@ class CallingApp {
         const voteId = `${this.clientId}:${Date.now()}:${Math.floor(Math.random() * 1e6)}`;
         // We are the ones asking, so our agreement is implied - and recorded,
         // because that is what lets us act on the result.
-        this._agreedVotes.add(voteId);
+        this._agreedVotes.set(voteId, { from: this.clientId, expiresAt: Date.now() + E2EE_VOTE_TIMEOUT_MS });
         this._pendingVote = { voteId, peers: new Set(peers), agreed: new Set(), reason };
 
         this.broadcastControl({ kind: 'e2ee-off-request', voteId, reason: reason || null });
@@ -2909,7 +2959,12 @@ class CallingApp {
         this._incomingVote = null;
         // Recorded before replying: this is what we check when the result comes
         // back, so we can never be switched off by a vote we refused.
-        if (agree) this._agreedVotes.add(vote.voteId);
+        if (agree) {
+            this._agreedVotes.set(vote.voteId, {
+                from: vote.from,
+                expiresAt: Date.now() + E2EE_VOTE_TIMEOUT_MS,
+            });
+        }
         this.sendControl(vote.from, { kind: 'e2ee-off-vote', voteId: vote.voteId, agree: !!agree });
     }
 
@@ -2933,11 +2988,35 @@ class CallingApp {
 
         clearTimeout(vote.timer);
         this._pendingVote = null;
-        this.broadcastControl({ kind: 'e2ee-off', voteId: vote.voteId });
+        this.broadcastControl({
+            kind: 'e2ee-off',
+            voteId: vote.voteId,
+            // Who was asked and who agreed, so a recipient can check the vote
+            // covered its own view of the room instead of taking our word.
+            peers: [this.clientId, ...vote.peers],
+            agreed: [this.clientId, ...vote.agreed],
+        });
         this._applyDisableEncryption();
     }
 
+    // Whatever this peer asked us or promised us dies with it. Otherwise a
+    // prompt from someone who has left stays on screen, and answering it mints
+    // an agreement nobody can legitimately spend.
+    _forgetVotesWith(peerId) {
+        this._agreedVotes.forEach((entry, voteId) => {
+            if (entry.from === peerId) this._agreedVotes.delete(voteId);
+        });
+        if (this._incomingVote && this._incomingVote.from === peerId) {
+            this._incomingVote = null;
+            this._hideVotePrompt();
+        }
+        if (this._pendingVote && this._pendingVote.peers.has(peerId)) {
+            this._failVote('Участник вышел — голосование отменено');
+        }
+    }
+
     _applyDisableEncryption() {
+        this._e2eeVotedOff = true;
         this.frameCryptor.disable();
         this.keyOwner = null;
         this.updateEncryptionUI(false);
