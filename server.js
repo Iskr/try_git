@@ -24,6 +24,17 @@ const HEARTBEAT_INTERVAL_MS = 30000;
 // Sockets that connect but never join are dropped — they are either broken
 // clients or a cheap way to sit on the connection cap.
 const IDLE_TIMEOUT_MS = intFromEnv('IDLE_TIMEOUT_MS', 120000, 10000);
+// Random matchmaking: strangers ask for a group of N and are seated together.
+const MAX_WAITING = intFromEnv('MAX_WAITING', 500, 2);
+const MAX_WAITING_PER_IP = intFromEnv('MAX_WAITING_PER_IP', 3, 1);
+// Nobody waits forever: an abandoned tab would otherwise hold a slot for good.
+const MAX_WAIT_MS = intFromEnv('MAX_WAIT_MS', 10 * 60 * 1000, 30000);
+// Bounds the work one enqueue may do while looking for distinct IPs.
+const MATCH_SCAN_LIMIT = 64;
+// Two tabs on one machine matched to each other is not a stranger call. Turn
+// this off where everyone legitimately shares an address — a single office
+// NAT, or a test run — or nobody there will ever be matched.
+const MATCH_REQUIRE_DISTINCT_IPS = process.env.MATCH_REQUIRE_DISTINCT_IPS !== '0';
 const MAX_MESSAGE_BYTES = 64 * 1024;
 // A client that stops reading must not be able to make us buffer without
 // bound. Generous enough that a mobile client renegotiating on a bad link is
@@ -305,6 +316,16 @@ const rooms = new Map();
 const connectionsByIp = new Map();
 // Map<ip, { windowStart, rooms: Set<roomId> }>
 const joinsByIp = new Map();
+// Map<size, Array<state>> — FIFO per requested group size, so the longest
+// waiter is always considered first and nobody starves.
+const waitingBySize = new Map();
+// Map<ip, count>, kept in step with the queues by removeFromQueue alone.
+const waitingByIp = new Map();
+// Map<roomId, Set<clientId>> — the roster a matched room was created for.
+// Matched rooms are single-use: nobody chose their code, and this app hands
+// the live E2EE key to any peer whose control channel opens, so a walk-in on
+// a guessed code would be handed the room's encryption key.
+const matchedRooms = new Map();
 
 function clientIpFrom(req) {
   const direct = (req.socket && req.socket.remoteAddress) || 'unknown';
@@ -406,6 +427,172 @@ function broadcast(roomId, message, excludeId) {
   });
 }
 
+// --- Random matchmaking ----------------------------------------------------
+
+// Every path out of the queue goes through here. waitingByIp leaks and locks
+// an IP out of matchmaking for good if any of them forgets to decrement.
+function removeFromQueue(state) {
+  if (!state.waitingSize) return;
+  const bucket = waitingBySize.get(state.waitingSize);
+  if (bucket) {
+    const index = bucket.indexOf(state);
+    if (index !== -1) bucket.splice(index, 1);
+    if (bucket.length === 0) waitingBySize.delete(state.waitingSize);
+  }
+  const left = (waitingByIp.get(state.ip) || 1) - 1;
+  if (left > 0) waitingByIp.set(state.ip, left);
+  else waitingByIp.delete(state.ip);
+  state.waitingSize = null;
+  state.waitingSince = 0;
+}
+
+function totalWaiting() {
+  let total = 0;
+  waitingBySize.forEach((bucket) => { total += bucket.length; });
+  return total;
+}
+
+function announceQueue(size) {
+  const bucket = waitingBySize.get(size);
+  if (!bucket) return;
+  bucket.forEach((state) => {
+    sendTo(state.ws, { type: 'waiting', size, queued: bucket.length });
+  });
+}
+
+// A room id nobody is using. Colliding would drop a matched group into
+// strangers' existing call, so this is a correctness check, not a nicety.
+function freeMatchRoomId() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const limit = 256 - (256 % chars.length);
+  for (let attempt = 0; attempt < 20; attempt++) {
+    let id = '';
+    while (id.length < 6) {
+      const byte = crypto.randomBytes(1)[0];
+      if (byte < limit) id += chars[byte % chars.length];
+    }
+    if (!rooms.has(id)) return id;
+  }
+  return null;
+}
+
+// Head-anchored so the longest waiter is always in the group we try to form:
+// if any valid group exists, one containing the head exists too, so FIFO
+// fairness holds and nobody is skipped forever.
+function tryMatch(size) {
+  const bucket = waitingBySize.get(size);
+  if (!bucket) return;
+
+  // Sockets that died while queued
+  for (let i = bucket.length - 1; i >= 0; i--) {
+    if (bucket[i].ws.readyState !== WebSocket.OPEN) removeFromQueue(bucket[i]);
+  }
+  if (bucket.length < size) return;
+  // Leave the group queued rather than half-seating it
+  if (rooms.size >= MAX_ROOMS) return;
+
+  const group = [bucket[0]];
+  const ips = new Set([bucket[0].ip]);
+  for (let i = 1; i < bucket.length && group.length < size && i < MATCH_SCAN_LIMIT; i++) {
+    if (MATCH_REQUIRE_DISTINCT_IPS && ips.has(bucket[i].ip)) continue;
+    ips.add(bucket[i].ip);
+    group.push(bucket[i]);
+  }
+  if (group.length < size) return;
+
+  const roomId = freeMatchRoomId();
+  if (!roomId) {
+    logWarn('Could not find a free room id for a match');
+    return;
+  }
+  commitMatch(group, roomId);
+}
+
+function commitMatch(group, roomId) {
+  group.forEach((state) => removeFromQueue(state));
+
+  const room = new Map();
+  rooms.set(roomId, room);
+  matchedRooms.set(roomId, new Set(group.map((s) => s.clientId)));
+
+  // Seat everyone before telling anyone, so the roster each client receives is
+  // already complete and negotiation starts from a settled room.
+  group.forEach((state) => {
+    room.set(state.clientId, state.ws);
+    state.roomId = roomId;
+    state.idleSince = null;
+  });
+
+  group.forEach((state) => {
+    sendTo(state.ws, {
+      type: 'joined',
+      roomId,
+      clientId: state.clientId,
+      participants: Array.from(room.keys()).filter((id) => id !== state.clientId),
+      resumeToken: resumeTokenFor(state.clientId),
+      matched: true,
+    });
+  });
+  // Deliberately no 'peer-joined' broadcast: clients treat that for a known id
+  // as "peer reconnected" and tear down the session the 'joined' just started.
+
+  logDebug(`Matched ${group.length} clients into ${roomId}`);
+}
+
+function handleWait(ws, state, rawSize) {
+  if (state.roomId) {
+    sendError(ws, 'already-in-call', 'Вы уже в звонке');
+    return;
+  }
+  const size = Number.isInteger(rawSize) ? rawSize : 0;
+  if (size < 2 || size > MAX_PARTICIPANTS) {
+    sendError(ws, 'invalid-size', `Размер группы — от 2 до ${MAX_PARTICIPANTS}`);
+    return;
+  }
+  // Re-sending the same size is an idempotent ack, so a client that repeats
+  // itself after a reconnect does not lose its place.
+  if (state.waitingSize === size) {
+    const bucket = waitingBySize.get(size);
+    sendTo(ws, { type: 'waiting', size, queued: bucket ? bucket.length : 1 });
+    return;
+  }
+  // Changing size goes to the back of the new queue: hopping must not jump it.
+  const previous = state.waitingSize;
+  if (previous) removeFromQueue(state);
+
+  if (!previous) {
+    if ((waitingByIp.get(state.ip) || 0) >= MAX_WAITING_PER_IP) {
+      sendError(ws, 'too-many-waiting', 'Слишком много ожиданий с этого адреса');
+      return;
+    }
+    if (totalWaiting() >= MAX_WAITING) {
+      sendError(ws, 'server-busy', 'Сервер перегружен, попробуйте позже');
+      return;
+    }
+  }
+
+  if (!waitingBySize.has(size)) waitingBySize.set(size, []);
+  waitingBySize.get(size).push(state);
+  waitingByIp.set(state.ip, (waitingByIp.get(state.ip) || 0) + 1);
+  state.waitingSize = size;
+  state.waitingSince = Date.now();
+  // A queued socket is doing something; the idle reaper must leave it alone.
+  state.idleSince = null;
+
+  tryMatch(size);
+  // Still queued? Tell this bucket where it stands.
+  if (state.waitingSize === size) announceQueue(size);
+}
+
+function handleUnwait(ws, state) {
+  if (!state.waitingSize) return;
+  const size = state.waitingSize;
+  removeFromQueue(state);
+  state.idleSince = Date.now();
+  sendTo(ws, { type: 'waiting-cancelled' });
+  announceQueue(size);
+}
+
 // `identity` is the clientId a verified rejoin asked to reuse, or null. Every
 // check below runs before the client's current seat is given up, so a join
 // that cannot be granted leaves the caller exactly where it was rather than
@@ -444,6 +631,16 @@ function handleJoin(ws, state, rawRoomId, identity) {
     return;
   }
 
+  // A matched room belongs to the strangers it was created for. Because
+  // `identity` is only set when the resume token verifies, this reads as "you
+  // are one of them, proven by a token you already hold" — a walk-in on a
+  // guessed code never is, and would otherwise be handed the room's E2EE key.
+  const roster = matchedRooms.get(roomId);
+  if (roster && !roster.has(clientId)) {
+    sendError(ws, 'invalid-room', 'Этот звонок закрыт для новых участников');
+    return;
+  }
+
   if (!existing && rooms.size >= MAX_ROOMS) {
     sendError(ws, 'server-busy', 'Сервер перегружен, попробуйте позже');
     return;
@@ -470,6 +667,7 @@ function handleJoin(ws, state, rawRoomId, identity) {
     rooms.set(roomId, room);
   }
 
+  removeFromQueue(state);
   room.set(state.clientId, ws);
   state.roomId = roomId;
   state.idleSince = null;
@@ -533,6 +731,7 @@ function handleLeave(state) {
 
   if (room.size === 0) {
     rooms.delete(roomId);
+    matchedRooms.delete(roomId);
     logDebug(`Room ${roomId} deleted (empty)`);
   }
 
@@ -640,6 +839,10 @@ wss.on('connection', (ws, req) => {
         handleSignaling(state, data);
       } else if (data.type === 'leave') {
         handleLeave(state);
+      } else if (data.type === 'wait') {
+        handleWait(ws, state, data.size);
+      } else if (data.type === 'unwait') {
+        handleUnwait(ws, state);
       }
       // Unknown message types are dropped silently.
     } catch (error) {
@@ -655,6 +858,7 @@ wss.on('connection', (ws, req) => {
       connectionsByIp.delete(ip);
     }
     logDebug(`Client disconnected: ${state.clientId}`);
+    removeFromQueue(state);
     handleLeave(state);
   });
 });
@@ -695,6 +899,17 @@ const heartbeat = setInterval(() => {
   });
 
   reapDeadEntries();
+
+  // Nobody waits forever: an abandoned tab would hold a slot indefinitely.
+  waitingBySize.forEach((bucket) => {
+    bucket.slice().forEach((state) => {
+      if (now - state.waitingSince <= MAX_WAIT_MS) return;
+      removeFromQueue(state);
+      // Hand it back to the ordinary idle reaper
+      state.idleSince = now;
+      sendTo(state.ws, { type: 'waiting-expired' });
+    });
+  });
 
   joinsByIp.forEach((entry, ip) => {
     if (now - entry.windowStart >= 120000) {
@@ -751,6 +966,8 @@ module.exports = {
   wss,
   rooms,
   stop,
+  waitingBySize,
+  matchedRooms,
   __testing: {
     normalizeCloudflareResponse,
     resetCloudflareCache(keepEntry) {
